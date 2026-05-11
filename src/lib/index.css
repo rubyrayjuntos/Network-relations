@@ -1,0 +1,25 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --color-obsidian-900: #0B0E14;
+  --color-obsidian-800: #151A22;
+  --color-obsidian-700: #222831;
+  
+  --color-biocyan-400: #00B2FF;
+  --color-biocyan-500: #0088CC;
+  
+  --color-bioemerald-400: #00FFC2;
+  --color-bioemerald-500: #00CC99;
+  
+  --color-biocrimson-400: #FF3366;
+  --color-biocrimson-500: #CC0033;
+
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-sans: 'Inter', sans-serif;
+}
+
+body {
+  @apply bg-obsidian-900 text-slate-300 font-mono;
+}
+
