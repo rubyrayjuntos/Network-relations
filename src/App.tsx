@@ -5,19 +5,20 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import * as d3 from 'd3';
-import { RefreshCw, Database, LogOut, X } from 'lucide-react';
+import { RefreshCw, Database, LogOut, X, Search, Plus, Loader2 } from 'lucide-react';
 import { Complex, cExp, cAbs, poincareTranslation, hashString } from './lib/math';
-import { betweennessCentrality } from './lib/graph';
+import { betweennessCentrality, calculateNetworkMetrics } from './lib/graph';
 import { 
-  PATHWAY_SEEDS, PROTEIN_ROLES, BINDING_SITES, FALLBACK_CENTRALITY, 
-  fetchStringNetwork, GraphData, fetchProteinDetails, ProteinDetails
+  INITIAL_SEEDS, fetchStringNetwork, fetchInteractors, GraphData, fetchProteinDetails, ProteinDetails,
+  fetchOmnipathInteractions, OmnipathInteraction
 } from './lib/api';
 import { cn } from './lib/utils';
+import { BooleanNetwork, SimState } from './lib/simulation';
 import { api, User, Preferences } from './lib/auth';
 import { Auth } from './components/Auth';
 
 const ZETA_DEFAULT = 1.0;
-const ALL_PATHWAYS = Object.keys(PATHWAY_SEEDS);
+const ALL_PATHWAYS = Object.keys(INITIAL_SEEDS);
 
 function getPrimaryCoords(centralityDict: Record<string, number>, zeta: number, selectedPathways: string[]) {
   const coords: Record<string, Complex> = {};
@@ -39,7 +40,7 @@ function getSecondaryCoords(
   localScale: number,
   selectedPathways: string[]
 ) {
-  const secCoords: Record<string, Complex> = {};
+  const nodePositions: Record<string, Complex[]> = {};
   
   for (const p of selectedPathways) {
     const G_s = secondaryGraphs[p];
@@ -63,8 +64,22 @@ function getSecondaryCoords(
       if (absZ >= 1.0) {
         z_global = { r: z_global.r * 0.99 / absZ, i: z_global.i * 0.99 / absZ };
       }
-      secCoords[`${p}|${u}`] = z_global;
+      if (!nodePositions[u]) nodePositions[u] = [];
+      nodePositions[u].push(z_global);
     });
+  }
+  
+  const secCoords: Record<string, Complex> = {};
+  for (const [u, positions] of Object.entries(nodePositions)) {
+    let sumR = 0, sumI = 0;
+    for (const pos of positions) {
+      sumR += pos.r;
+      sumI += pos.i;
+    }
+    secCoords[u] = {
+      r: sumR / positions.length,
+      i: sumI / positions.length
+    };
   }
   return secCoords;
 }
@@ -75,15 +90,29 @@ export default function App() {
 
   const [zeta, setZeta] = useState(ZETA_DEFAULT);
   const [bloomScale, setBloomScale] = useState(1.8);
-  const [selectedPathways, setSelectedPathways] = useState<string[]>(ALL_PATHWAYS);
+  const [primaryCentrality, setPrimaryCentrality] = useState<Record<string, number>>({});
+  const [secondaryGraphs, setSecondaryGraphs] = useState<Record<string, GraphData>>({});
+  const [globalMetrics, setGlobalMetrics] = useState<{ nodes: number, edges: number, avgClusteringCoefficient: number, avgPathLength: number } | null>(null);
+  const hubNodes = useMemo(() => Object.keys(secondaryGraphs), [secondaryGraphs]);
+  const [selectedPathways, setSelectedPathways] = useState<string[]>(Object.keys(INITIAL_SEEDS));
   
   const [bloomNode, setBloomNode] = useState<string | null>(null);
-  const [primaryCentrality, setPrimaryCentrality] = useState(FALLBACK_CENTRALITY);
-  const [secondaryGraphs, setSecondaryGraphs] = useState<Record<string, GraphData>>({});
-  const [statusMsg, setStatusMsg] = useState<React.ReactNode>("DepMap + STRING integration active.");
+  const [statusMsg, setStatusMsg] = useState<React.ReactNode>("STRING Network Integration Active.");
   
+  const [omnipathEdges, setOmnipathEdges] = useState<OmnipathInteraction[]>([]);
+
+  // Boolean Network Simulation Engine
+  const [simEngine, setSimEngine] = useState<BooleanNetwork | null>(null);
+  const [simState, setSimState] = useState<SimState>({});
+  const [knockouts, setKnockouts] = useState<Set<string>>(new Set());
+  const [isSimRunning, setIsSimRunning] = useState(false);
+  const [isKnockoutMode, setIsKnockoutMode] = useState(false);
+  const [simSpeed, setSimSpeed] = useState(500);
+  
+  const [showExpression, setShowExpression] = useState(false);
+
   const [loadingString, setLoadingString] = useState(false);
-  const [loadingDepMap, setLoadingDepMap] = useState(false);
+  const [expandingNode, setExpandingNode] = useState<string | null>(null);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const gRef = useRef<SVGGElement>(null);
@@ -98,7 +127,7 @@ export default function App() {
   useEffect(() => {
     const newConnected = new Set<string>();
     if (activeNode) {
-      if (ALL_PATHWAYS.includes(activeNode)) {
+      if (hubNodes.includes(activeNode)) {
         if (secondaryGraphs[activeNode]) {
           secondaryGraphs[activeNode].nodes.forEach(n => newConnected.add(n));
         }
@@ -115,7 +144,7 @@ export default function App() {
       }
     }
     setConnectedNodes(newConnected);
-  }, [activeNode, secondaryGraphs, selectedPathways]);
+  }, [activeNode, secondaryGraphs, selectedPathways, hubNodes]);
 
   // Check auth on mount
   useEffect(() => {
@@ -126,7 +155,10 @@ export default function App() {
           if (prefs) {
             setZeta(prefs.zeta);
             setBloomScale(prefs.bloomScale);
-            setSelectedPathways(prefs.selectedPathways);
+            // Only restore if valid
+            if (prefs.selectedPathways && prefs.selectedPathways.length > 0) {
+              setSelectedPathways(prefs.selectedPathways);
+            }
           }
         }).catch(console.error);
       }
@@ -148,7 +180,7 @@ export default function App() {
 
   // Initial load of STRING data
   useEffect(() => {
-    if (user) {
+    if (user && Object.keys(secondaryGraphs).length === 0) {
       handleRefreshString();
     }
   }, [user]);
@@ -174,55 +206,135 @@ export default function App() {
 
   // Fetch protein details when active
   useEffect(() => {
-    if (activeNode && !ALL_PATHWAYS.includes(activeNode) && !proteinDetailsCache[activeNode]) {
+    if (activeNode && !hubNodes.includes(activeNode) && !proteinDetailsCache[activeNode]) {
       fetchProteinDetails(activeNode).then(details => {
         if (details) {
           setProteinDetailsCache(prev => ({ ...prev, [activeNode]: details }));
         }
       });
     }
-  }, [activeNode, proteinDetailsCache]);
+  }, [activeNode, hubNodes, proteinDetailsCache]);
+
+  const updateGlobalCentrality = (graphs: Record<string, GraphData>) => {
+    // Merge all currently visible networks to calculate true network centrality
+    const allNodes = new Set<string>();
+    const allEdges: [string, string][] = [];
+    
+    Object.values(graphs).forEach(G => {
+      G.nodes.forEach(n => allNodes.add(n));
+      G.edges.forEach(e => allEdges.push(e));
+    });
+    
+    if (allNodes.size > 0) {
+      const globalBet = betweennessCentrality(Array.from(allNodes), allEdges);
+      
+      // Calculate hub centrality (max centrality of its nodes)
+      const hubCentrality: Record<string, number> = {};
+      Object.entries(graphs).forEach(([hub, G]) => {
+        let maxC = 0;
+        G.nodes.forEach(n => {
+          if (globalBet[n] > maxC) maxC = globalBet[n];
+        });
+        hubCentrality[hub] = maxC;
+      });
+      
+      // Normalize hub centrality
+      const maxHubC = Math.max(...Object.values(hubCentrality), 1);
+      Object.keys(hubCentrality).forEach(h => hubCentrality[h] /= maxHubC);
+      
+      setPrimaryCentrality(hubCentrality);
+      
+      // Calculate global network metrics for the dashboard
+      const metrics = calculateNetworkMetrics(Array.from(allNodes), allEdges);
+      setGlobalMetrics(metrics);
+    }
+  };
+
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (isSimRunning && simEngine) {
+      interval = setInterval(() => {
+        setSimState(simEngine.tick());
+      }, simSpeed);
+    }
+    return () => clearInterval(interval);
+  }, [isSimRunning, simEngine, simSpeed]);
+
+  const handleToggleSim = () => {
+    if (isSimRunning) {
+      setIsSimRunning(false);
+      setStatusMsg("Simulation Paused.");
+    } else {
+      if (!simEngine) {
+        const nodes = Object.keys(mappedSecCoords);
+        const edges = uniqueEdges.map(([u, v]) => [u, v] as [string, string]);
+        const engine = new BooleanNetwork(nodes, edges, omnipathEdges);
+        setSimEngine(engine);
+        setSimState(engine.state);
+      }
+      setIsSimRunning(true);
+      setStatusMsg(<span className="text-amber-400 font-medium">⚡ Boolean Network Simulation Running...</span>);
+    }
+  };
+
+  const handleResetSim = () => {
+    setIsSimRunning(false);
+    const nodes = Object.keys(mappedSecCoords);
+    const edges = uniqueEdges.map(([u, v]) => [u, v] as [string, string]);
+    const engine = new BooleanNetwork(nodes, edges, omnipathEdges);
+    setSimEngine(engine);
+    setSimState(engine.state);
+    setKnockouts(new Set());
+    setStatusMsg("Simulation Reset.");
+  };
 
   const handleRefreshString = async () => {
     setLoadingString(true);
     try {
       const newGraphs: Record<string, GraphData> = {};
-      for (const [pathway, seeds] of Object.entries(PATHWAY_SEEDS)) {
+      for (const [pathway, seeds] of Object.entries(INITIAL_SEEDS)) {
         newGraphs[pathway] = await fetchStringNetwork(seeds);
       }
       setSecondaryGraphs(newGraphs);
-      setStatusMsg(<span className="text-emerald-600 font-medium">✅ STRING PPI data refreshed.</span>);
+      updateGlobalCentrality(newGraphs);
+      setSelectedPathways(Object.keys(newGraphs));
+      setStatusMsg(<span className="text-emerald-600 font-medium">✅ Initial PPI network seeded.</span>);
     } catch (e) {
-      setStatusMsg(<span className="text-red-600 font-medium">❌ Failed to refresh STRING data.</span>);
+      setStatusMsg(<span className="text-red-600 font-medium">❌ Failed to fetch STRING data.</span>);
     } finally {
       setLoadingString(false);
     }
   };
 
-  const handleRefreshDepMap = async () => {
-    setLoadingDepMap(true);
-    setStatusMsg("Downloading latest DepMap CRISPRGeneDependency.csv (~400MB, one-time)...");
-    
-    setTimeout(() => {
-      setPrimaryCentrality({...FALLBACK_CENTRALITY});
-      setStatusMsg(<span className="text-emerald-600 font-medium">✅ DepMap centrality refreshed from latest CRISPRGeneDependency scores.</span>);
-      setLoadingDepMap(false);
-    }, 1500);
+  const handleExpandNetwork = async (protein: string) => {
+    setExpandingNode(protein);
+    setStatusMsg(`Fetching direct interactors for ${protein}...`);
+    try {
+      const newGraph = await fetchInteractors(protein, 15);
+      setSecondaryGraphs(prev => {
+        const next = { ...prev, [protein]: newGraph };
+        updateGlobalCentrality(next);
+        return next;
+      });
+      setSelectedPathways(prev => prev.includes(protein) ? prev : [...prev, protein]);
+      setActiveNode(protein); // Switch focus to the new hub
+      setBloomNode(protein);
+      setStatusMsg(<span className="text-emerald-600 font-medium">✅ Expanded network for {protein}.</span>);
+    } catch (e) {
+      setStatusMsg(<span className="text-red-600 font-medium">❌ Failed to expand network.</span>);
+    } finally {
+      setExpandingNode(null);
+    }
   };
 
   const handleNodeClick = (node: string) => {
     setActiveNode(node);
-    if (ALL_PATHWAYS.includes(node)) {
+    if (hubNodes.includes(node)) {
       setBloomNode(node);
       setStatusMsg(
         <div className="text-biocyan-400">
-          <h5 className="font-bold text-lg mb-1">🌟 Bloomed: {node}</h5>
-          <p className="mb-2 text-sm text-slate-300">DepMap-driven centrality + key stabilizing interfaces:</p>
-          <ul className="list-disc pl-5 text-sm space-y-1 text-slate-400">
-            {secondaryGraphs[node]?.nodes.filter(prot => BINDING_SITES[prot]).map(prot => (
-              <li key={prot}>• {prot} — {BINDING_SITES[prot]}</li>
-            ))}
-          </ul>
+          <h5 className="font-bold text-lg mb-1">🌟 Bloomed Hub: {node}</h5>
+          <p className="mb-2 text-sm text-slate-300">Live sub-network focus activated.</p>
         </div>
       );
     }
@@ -275,15 +387,14 @@ export default function App() {
       return;
     }
     
-    if (ALL_PATHWAYS.includes(activeNode)) {
+    if (hubNodes.includes(activeNode)) {
       targetCenterRef.current = primCoords[activeNode] || { r: 0, i: 0 };
     } else {
-      const key = Object.keys(secCoords).find(k => k.split('|')[1] === activeNode);
-      if (key) {
-        targetCenterRef.current = secCoords[key] || { r: 0, i: 0 };
+      if (secCoords[activeNode]) {
+        targetCenterRef.current = secCoords[activeNode];
       }
     }
-  }, [activeNode, primCoords, secCoords]);
+  }, [activeNode, primCoords, secCoords, hubNodes]);
 
   // Mapped coordinates applying the Möbius Transformation
   const mappedPrimCoords = useMemo(() => {
@@ -302,12 +413,51 @@ export default function App() {
     return res;
   }, [secCoords, currentCenter]);
 
+  const uniqueEdges = useMemo(() => {
+    const edgeSet = new Map<string, [string, string, string]>();
+    selectedPathways.forEach(p => {
+      const G_s = secondaryGraphs[p];
+      if (G_s) {
+        G_s.edges.forEach(([u, v]) => {
+          const key = u < v ? `${u}-${v}` : `${v}-${u}`;
+          if (!edgeSet.has(key)) {
+             edgeSet.set(key, [u, v, p]);
+          }
+        });
+      }
+    });
+    return Array.from(edgeSet.values());
+  }, [selectedPathways, secondaryGraphs]);
+
+  // Re-fetch Omnipath when network topology changes significantly
+  useEffect(() => {
+    const allNodesSet = new Set<string>();
+    uniqueEdges.forEach(([u, v]) => {
+      allNodesSet.add(u);
+      allNodesSet.add(v);
+    });
+    const allNodes = Array.from(allNodesSet);
+    if (allNodes.length === 0) return;
+    
+    // Throttle / debounce omnipath fetching so it doesn't spam on minor changes
+    const timeout = setTimeout(() => {
+      fetchOmnipathInteractions(allNodes).then(edges => {
+        setOmnipathEdges(edges);
+        if (edges.length > 0) {
+          setStatusMsg(<span className="text-emerald-500 text-xs">Loaded {edges.length} directed regulatory interactions.</span>);
+        }
+      });
+    }, 1000);
+    
+    return () => clearTimeout(timeout);
+  }, [uniqueEdges]);
+
   // Determine opacity for a node based on current selection
   const getNodeOpacity = (node: string, isPathway: boolean) => {
     if (!activeNode) return 1;
     if (node === activeNode) return 1;
     if (isPathway) {
-      if (!ALL_PATHWAYS.includes(activeNode)) {
+      if (!hubNodes.includes(activeNode)) {
         const inPathway = secondaryGraphs[node]?.nodes.includes(activeNode);
         return inPathway ? 0.8 : 0.2;
       }
@@ -318,11 +468,19 @@ export default function App() {
 
   // Color Category Helper
   const getProteinColorCat = (u: string) => {
-    const roleInfo = PROTEIN_ROLES[u] || ["unknown", false];
-    if (roleInfo[0] === "tumor_suppressor") return "azure";
-    if (roleInfo[1]) return "mint";
-    return "amber";
+    const details = proteinDetailsCache[u];
+    if (details) {
+      if (details.inferredRole === "tumor_suppressor") return "azure";
+      if (details.inferredRole === "oncogene") return "crimson";
+      if (details.druggable) return "mint";
+      return "amber";
+    }
+    
+    // Stable pseudo-random color assignment for un-cached nodes
+    const h = hashString(u) % 4;
+    return h === 0 ? "azure" : h === 1 ? "mint" : h === 2 ? "amber" : "slate";
   };
+  
   const COLOR_HEX: Record<string, string> = {
     azure: "#00B2FF",
     mint: "#00FFC2",
@@ -331,9 +489,29 @@ export default function App() {
     slate: "#475569"
   };
   
+  const expressionColorScale = useMemo(() => {
+    return d3.scaleLinear<string>()
+      .domain([-3, 0, 3])
+      .range(["#3b82f6", "#334155", "#ef4444"])
+      .clamp(true);
+  }, []);
+
+  const getNodeColor = (u: string) => {
+    if (showExpression) {
+      const details = proteinDetailsCache[u];
+      if (details && details.expressionLevel !== undefined) {
+        return expressionColorScale(details.expressionLevel);
+      }
+      return "#334155";
+    }
+    const cat = getProteinColorCat(u);
+    return COLOR_HEX[cat];
+  };
+
   const GRADIENT_PAIRS = [
     ['azure', 'mint'], ['azure', 'amber'], ['mint', 'amber'],
-    ['azure', 'azure'], ['mint', 'mint'], ['amber', 'amber']
+    ['azure', 'azure'], ['mint', 'mint'], ['amber', 'amber'],
+    ['crimson', 'amber'], ['crimson', 'azure'], ['slate', 'slate']
   ];
 
   const R = 400; // Increased radius for extra whitespace padding
@@ -360,7 +538,7 @@ export default function App() {
     <div className="min-h-screen bg-obsidian-900 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-obsidian-800 to-obsidian-900 p-4 lg:p-6 font-mono text-slate-300 flex overflow-hidden">
       
       {/* Main Content Area */}
-      <div className={`flex-1 flex flex-col transition-all duration-300 ${activeNode && !ALL_PATHWAYS.includes(activeNode) ? 'max-w-[calc(100vw-360px)]' : 'w-full'} h-[calc(100vh-32px)]`}>
+      <div className={`flex-1 flex flex-col transition-all duration-300 ${activeNode && !hubNodes.includes(activeNode) ? 'max-w-[calc(100vw-360px)]' : 'w-full'} h-[calc(100vh-32px)]`}>
         
         {/* Header / Breadcrumbs */}
         <div className="flex justify-between items-center mb-4 z-10 relative px-4 py-3 bg-obsidian-800/60 backdrop-blur-md rounded-xl border border-white/5 shadow-lg">
@@ -389,14 +567,42 @@ export default function App() {
         >
           {/* Status Indicator Top Right */}
           <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-2 text-xs">
-            <div className="flex items-center gap-2 bg-obsidian-800/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
-              <div className={cn("w-2 h-2 rounded-full", loadingString ? "bg-yellow-400 animate-pulse" : "bg-bioemerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]")}></div>
-              <span>{loadingString ? "Syncing STRING Node..." : "STRING Synced"}</span>
+            <div className="flex items-center gap-2 bg-obsidian-800/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 text-slate-300">
+              <div className={cn("w-2 h-2 rounded-full", loadingString ? "bg-amber-400 animate-pulse" : "bg-bioemerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]")}></div>
+              <span>{loadingString ? "Querying STRING..." : "STRING API Active"}</span>
             </div>
-            <div className="flex items-center gap-2 bg-obsidian-800/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
-              <div className={cn("w-2 h-2 rounded-full", loadingDepMap ? "bg-yellow-400 animate-pulse" : "bg-bioemerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]")}></div>
-              <span>{loadingDepMap ? "Syncing DepMap..." : "DepMap Live"}</span>
+            <div className="flex items-center gap-2 bg-obsidian-800/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 text-slate-300">
+              <div className={cn("w-2 h-2 rounded-full", "bg-biocyan-500 shadow-[0_0_8px_rgba(0,178,255,0.8)]")}></div>
+              <span>MyGene API Active</span>
             </div>
+            
+            {/* Global Network Metrics Dashboard */}
+            {globalMetrics && (
+              <div className="mt-2 bg-obsidian-800/80 backdrop-blur-xl p-4 rounded-xl border border-white/10 shadow-[0_8px_32px_rgba(0,0,0,0.6)] w-56 text-slate-300">
+                <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3 flex items-center gap-2">
+                  <Database className="w-3 h-3 text-biocyan-400" />
+                  Network Topology
+                </h3>
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-400">Total Nodes</span>
+                    <span className="font-mono text-white">{globalMetrics.nodes}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-400">Total Edges</span>
+                    <span className="font-mono text-white">{globalMetrics.edges}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-400" title="Average Path Length">Avg Path</span>
+                    <span className="font-mono text-biocyan-400">{globalMetrics.avgPathLength.toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-400" title="Clustering Coefficient">Clustering</span>
+                    <span className="font-mono text-bioemerald-400">{globalMetrics.avgClusteringCoefficient.toFixed(3)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           <svg ref={svgRef} className="w-full h-full cursor-crosshair active:cursor-grabbing" onClick={() => setActiveNode(null)}>
@@ -519,50 +725,57 @@ export default function App() {
               })}
 
               {/* Edges */}
-              {selectedPathways.flatMap(p => {
-                const G_s = secondaryGraphs[p];
-                if (!G_s) return [];
-                return G_s.edges.map(([u, v]) => {
-                  const z_u = mappedSecCoords[`${p}|${u}`];
-                  const z_v = mappedSecCoords[`${p}|${v}`];
+              {uniqueEdges.map(([u, v, p]) => {
+                  const z_u = mappedSecCoords[u];
+                  const z_v = mappedSecCoords[v];
                   if (!z_u || !z_v) return null;
                   
                   const isConnectedToActive = activeNode && (u === activeNode || v === activeNode);
-                  const isNodeActive = activeNode ? (u === activeNode && v === activeNode) : false;
                   
-                  const catU = getProteinColorCat(u);
-                  const catV = getProteinColorCat(v);
-                  const strokeColor = isConnectedToActive ? `url(#grad-${catU}-${catV})` : "#475569";
-                  const strokeWidth = isConnectedToActive ? 2 : 1;
-                  const edgeOpacity = activeNode ? (isConnectedToActive ? 0.7 : 0.05) : 0.3;
+                  let strokeColor = isConnectedToActive ? `url(#grad-${getProteinColorCat(u)}-${getProteinColorCat(v)})` : "#475569";
+                  let strokeWidth = isConnectedToActive ? 2 : 1;
+                  let edgeOpacity = activeNode ? (isConnectedToActive ? 0.7 : 0.05) : 0.3;
+                  
+                  if (isSimRunning && simEngine) {
+                    const weightForward = simEngine.edgeWeights.get(`${u}-${v}`);
+                    const weightBackward = simEngine.edgeWeights.get(`${v}-${u}`);
+                    const weight = weightForward !== undefined ? weightForward : (weightBackward !== undefined ? weightBackward : 0);
+                    
+                    const isActiveEdge = simState[u] || simState[v];
+                    
+                    if (weight === 0) {
+                      strokeColor = "#1e293b";
+                      strokeWidth = 1;
+                      edgeOpacity = 0.1;
+                    } else {
+                      strokeColor = weight > 0 ? (isActiveEdge ? "#10b981" : "#064e3b") : (isActiveEdge ? "#f43f5e" : "#881337");
+                      strokeWidth = isActiveEdge ? 2 : 1;
+                      edgeOpacity = isActiveEdge ? 0.7 : 0.15;
+                    }
+                  }
                   
                   return (
                     <line 
-                      key={`${p}-${u}-${v}`}
+                      key={`${u}-${v}`}
                       x1={z_u.r * R} y1={-z_u.i * R}
                       x2={z_v.r * R} y2={-z_v.i * R}
                       stroke={strokeColor} 
                       strokeWidth={strokeWidth} 
-                      strokeDasharray={isConnectedToActive ? "none" : "3,3"} 
+                      strokeDasharray={isConnectedToActive && !isSimRunning ? "none" : (isSimRunning ? ((simEngine?.edgeWeights.get(`${u}-${v}`) ?? simEngine?.edgeWeights.get(`${v}-${u}`) ?? 0) < 0 ? "4,4" : "none") : "3,3")} 
                       opacity={edgeOpacity}
                       className="transition-all duration-500"
                     />
                   );
-                });
               })}
 
               {/* Secondary Nodes */}
-              {Object.entries(mappedSecCoords).map(([key, z]: [string, Complex]) => {
-                const [p, u] = key.split('|');
-                const roleInfo = PROTEIN_ROLES[u] || ["unknown", false];
-                const role = roleInfo[0];
-                const druggable = roleInfo[1];
-                const cat = getProteinColorCat(u);
-                const color = COLOR_HEX[cat];
+              {Object.entries(mappedSecCoords).map(([u, z]: [string, Complex]) => {
+                const details = proteinDetailsCache[u];
+                const druggable = details ? details.druggable : false;
+                const color = getNodeColor(u);
                 
-                // Proxy for centrality (top nodes)
-                const G_s = secondaryGraphs[p];
-                const degree = G_s ? G_s.edges.filter(([a,b]) => a===u || b===u).length : 0;
+                // Calculate global degree for highlighting top nodes
+                const degree = uniqueEdges.filter(([a,b]) => a===u || b===u).length;
                 const isCentral = degree > 4;
 
                 const size = druggable ? 14 : Math.max(9, 6 + (hoveredProtein === u ? 2 : 0));
@@ -599,7 +812,7 @@ export default function App() {
                 const showLabel = isActive || isHovered || (activeNode && connectedNodes.has(u)) || (!activeNode && isCentral);
 
                 return (
-                  <g key={key} className="transition-all duration-500" style={{ opacity }}>
+                  <g key={u} className="transition-all duration-500" style={{ opacity }}>
                     {/* The Radial Tether and Label */}
                     {showLabel && (
                       <g className="pointer-events-none">
@@ -626,25 +839,43 @@ export default function App() {
                     <g transform={`translate(${cx}, ${cy})`}
                        onMouseEnter={() => setHoveredProtein(u)}
                        onMouseLeave={() => setHoveredProtein(null)}
-                       onClick={(e) => { e.stopPropagation(); handleNodeClick(u); }}
-                       className="cursor-crosshair"
+                       onClick={(e) => { 
+                         e.stopPropagation(); 
+                         if (isSimRunning && simEngine) {
+                           if (isKnockoutMode) {
+                             simEngine.toggleKnockout(u);
+                             setKnockouts(new Set(simEngine.knockouts));
+                           } else {
+                             const newState = !simState[u];
+                             simEngine.setState(u, newState);
+                             setSimState({ ...simEngine.state });
+                           }
+                         } else {
+                           handleNodeClick(u); 
+                         }
+                       }}
+                       className={isSimRunning ? (isKnockoutMode ? "cursor-alias" : "cursor-pointer") : "cursor-crosshair"}
                     >
-                      {isActive && hudBracket}
+                      {isActive && !isSimRunning && hudBracket}
                       {/* Simple custom glow mapping dynamically */}
                       <circle 
-                        r={size + (isActive ? 4 : 0)} 
-                        fill={color} 
-                        stroke={isActive ? "#ffffff" : "#0B0E14"} 
-                        strokeWidth={isActive ? 2 : 1} 
+                        r={size + (isActive && !isSimRunning ? 4 : 0)} 
+                        fill={isSimRunning ? (knockouts.has(u) ? "#0f172a" : (simState[u] ? color : "#1e293b")) : color} 
+                        stroke={(isActive && !isSimRunning) || (isSimRunning && simState[u]) ? "#ffffff" : (knockouts.has(u) ? "#ef4444" : "#0B0E14")} 
+                        strokeWidth={(isActive && !isSimRunning) || (isSimRunning && simState[u]) || knockouts.has(u) ? 2 : 1} 
+                        strokeDasharray={knockouts.has(u) ? "2,2" : "none"}
                         className="transition-all duration-300"
                       />
+                      {knockouts.has(u) && (
+                        <path d={`M ${-size/2} ${-size/2} L ${size/2} ${size/2} M ${size/2} ${-size/2} L ${-size/2} ${size/2}`} stroke="#ef4444" strokeWidth="2" />
+                      )}
                       <circle 
                         r={size * 1.5} 
                         fill={color} 
-                        opacity={isCentral ? 0.4 : 0.1} 
+                        opacity={isSimRunning ? (simState[u] ? 0.8 : 0) : (isCentral ? 0.4 : 0.1)} 
                         filter="url(#glow-emerald)" 
                         className="pointer-events-none transition-all duration-300"
-                        style={{ filter: `drop-shadow(0 0 ${blurValue*2}px ${color})` }}
+                        style={{ filter: `drop-shadow(0 0 ${isSimRunning && simState[u] ? 15 : blurValue*2}px ${color})` }}
                       />
                     </g>
                   </g>
@@ -655,11 +886,80 @@ export default function App() {
 
           {/* Neumorphic Control Pod */}
           <div className="absolute bottom-6 left-6 z-10 w-80 bg-obsidian-800/80 backdrop-blur-xl p-5 rounded-2xl border border-white/10 shadow-[0_8px_32px_rgba(0,0,0,0.6)] space-y-4">
-            <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2">Simulation Parameters</h3>
+            <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2">
+              {omnipathEdges.length > 0 ? "Systems Biology Knockout Engine" : "Illustrative Boolean Engine"}
+            </h3>
+            <p className={cn("text-[10px] leading-tight mb-2 -mt-1", omnipathEdges.length > 0 ? "text-emerald-500/80" : "text-slate-500")}>
+              {omnipathEdges.length > 0 
+                ? `*Simulation powered by ${omnipathEdges.length} directed regulatory interactions from OmniPath.`
+                : "*Animation based on randomized weights over undirected STRING edges. Not biologically predictive."}
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={handleToggleSim}
+                className={cn(
+                  "flex-1 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors border",
+                  isSimRunning 
+                    ? "bg-amber-500/20 text-amber-400 border-amber-500/50 hover:bg-amber-500/30" 
+                    : "bg-biocyan-500/20 text-biocyan-400 border-biocyan-500/50 hover:bg-biocyan-500/30"
+                )}
+              >
+                {isSimRunning ? "Pause Sim" : "Start Sim"}
+              </button>
+              <button
+                onClick={() => setIsKnockoutMode(!isKnockoutMode)}
+                className={cn(
+                  "flex-1 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors border",
+                  isKnockoutMode
+                    ? "bg-biocrimson-500/20 text-biocrimson-400 border-biocrimson-500/50 hover:bg-biocrimson-500/30"
+                    : "bg-slate-800 text-slate-400 border-white/10 hover:bg-slate-700"
+                )}
+                title="Toggle Knockout Mode (Click nodes to disable them)"
+              >
+                Knockouts: {isKnockoutMode ? "ON" : "OFF"}
+              </button>
+              <button
+                onClick={handleResetSim}
+                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold border border-white/10 transition-colors"
+                title="Reset Simulation"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            </div>
+            {simEngine && (
+              <div className="pt-2">
+                <div className="flex justify-between text-xs mb-1">
+                  <span className="text-slate-300">Sim Speed</span>
+                  <span className="text-amber-400 font-bold">{simSpeed}ms</span>
+                </div>
+                <input 
+                  type="range" min="100" max="2000" step="100" value={simSpeed} 
+                  onChange={e => setSimSpeed(parseInt(e.target.value))}
+                  className="w-full h-1 bg-obsidian-900 rounded-lg appearance-none cursor-pointer accent-amber-500"
+                />
+              </div>
+            )}
+            
+            <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2 mt-6">Visual Overlays</h3>
+            <div>
+              <button
+                onClick={() => setShowExpression(!showExpression)}
+                className={cn(
+                  "w-full py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors border",
+                  showExpression 
+                    ? "bg-bioemerald-500/20 text-bioemerald-400 border-bioemerald-500/50 hover:bg-bioemerald-500/30" 
+                    : "bg-slate-800 text-slate-400 border-white/10 hover:bg-slate-700"
+                )}
+              >
+                {showExpression ? "Hide Gene Expression" : "Show Gene Expression"}
+              </button>
+            </div>
+            
+            <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2 mt-6">Hyperbolic View</h3>
             <div className="space-y-4">
               <div>
                 <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-300">Hyperbolic Spread (ζ)</span>
+                  <span className="text-slate-300">Spread (ζ)</span>
                   <span className="text-biocyan-400 font-bold">{zeta.toFixed(1)}</span>
                 </div>
                 <input 
@@ -684,7 +984,7 @@ export default function App() {
             <div className="pt-3 border-t border-white/5">
                <div className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2">Systems</div>
                <div className="flex flex-wrap gap-2">
-                 {ALL_PATHWAYS.map(p => (
+                 {hubNodes.map(p => (
                    <label key={p} className={cn(
                      "flex items-center gap-1.5 px-2 py-1 text-xs rounded-md border cursor-pointer transition-colors",
                      selectedPathways.includes(p) 
@@ -703,7 +1003,7 @@ export default function App() {
       </div>
 
       {/* Info-Panel Sidebar */}
-      {activeNode && !ALL_PATHWAYS.includes(activeNode) && (
+      {activeNode && !hubNodes.includes(activeNode) && (
         <div className="w-[340px] ml-4 bg-obsidian-800/80 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl p-5 flex flex-col h-[calc(100vh-32px)] overflow-y-auto custom-scrollbar animate-slide-left relative">
           <button 
             onClick={() => setActiveNode(null)}
@@ -713,28 +1013,41 @@ export default function App() {
           </button>
           
           <h2 className="text-2xl font-bold font-sans text-white mb-1 tracking-tight">{activeNode}</h2>
-          {PROTEIN_ROLES[activeNode] && (
+          
+          {proteinDetailsCache[activeNode] && proteinDetailsCache[activeNode].inferredRole !== "unknown" && (
             <div className="text-sm font-medium text-biocyan-400 mb-6 capitalize flex items-center gap-2">
               <div className={cn("w-2 h-2 rounded-full", 
-                PROTEIN_ROLES[activeNode][0] === 'tumor_suppressor' ? 'bg-biocyan-500' : 
-                PROTEIN_ROLES[activeNode][1] ? 'bg-bioemerald-500' : 'bg-yellow-500'
+                proteinDetailsCache[activeNode].inferredRole === 'tumor_suppressor' ? 'bg-biocyan-500' : 'bg-biocrimson-500'
               )}></div>
-              {PROTEIN_ROLES[activeNode][0].replace('_', ' ')}
+              {proteinDetailsCache[activeNode].inferredRole?.replace('_', ' ')}
             </div>
           )}
 
           <div className="space-y-6 flex-1">
             <section>
-              <h3 className="text-xs font-bold text-slate-500 tracking-wider uppercase mb-3 border-b border-white/5 pb-1">STRING Integration</h3>
+              <h3 className="text-xs font-bold text-slate-500 tracking-wider uppercase mb-3 border-b border-white/5 pb-1">Network Context</h3>
               <div className="space-y-2 text-sm text-slate-300">
                 <div className="flex justify-between">
                   <span className="text-slate-500">Connections:</span>
-                  <span className="font-mono text-white">{connectedNodes.size} nodes</span>
+                  <span className="font-mono text-white">{connectedNodes.size} visible</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-500">Target Type:</span>
-                  <span className="font-mono text-white text-right">{BINDING_SITES[activeNode] || 'Interface hub'}</span>
+                  <span className="font-mono text-white text-right">
+                    {proteinDetailsCache[activeNode]?.druggable ? 'Druggable Kinase/Receptor' : 'Peripheral Target'}
+                  </span>
                 </div>
+                {proteinDetailsCache[activeNode]?.expressionLevel !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Synthetic Exp (Log2FC):</span>
+                    <span className={cn(
+                      "font-mono font-bold text-right",
+                      proteinDetailsCache[activeNode]!.expressionLevel! > 0 ? "text-red-400" : "text-blue-400"
+                    )}>
+                      {proteinDetailsCache[activeNode]!.expressionLevel! > 0 ? "+" : ""}{proteinDetailsCache[activeNode]!.expressionLevel!.toFixed(2)}
+                    </span>
+                  </div>
+                )}
               </div>
             </section>
 
@@ -742,7 +1055,7 @@ export default function App() {
               <section className="animate-fade-in space-y-4">
                 <div>
                   <h3 className="text-xs font-bold text-slate-500 tracking-wider uppercase mb-2 border-b border-white/5 pb-1">Function</h3>
-                  <p className="text-sm text-slate-300 leading-relaxed font-sans">{proteinDetailsCache[activeNode].summary || "No data available."}</p>
+                  <p className="text-sm text-slate-300 leading-relaxed font-sans">{proteinDetailsCache[activeNode].summary || "No automated summary available."}</p>
                 </div>
                 
                 {proteinDetailsCache[activeNode].go?.BP && proteinDetailsCache[activeNode].go!.BP!.length > 0 && (
@@ -772,6 +1085,17 @@ export default function App() {
                     </ul>
                   </div>
                 )}
+                
+                <div className="pt-4 pb-2 border-t border-white/5">
+                  <button 
+                    onClick={() => handleExpandNetwork(activeNode)}
+                    disabled={expandingNode === activeNode}
+                    className="w-full py-2.5 px-4 bg-biocyan-500/10 hover:bg-biocyan-500/20 text-biocyan-400 border border-biocyan-500/30 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                  >
+                    {expandingNode === activeNode ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                    Expand Interactors
+                  </button>
+                </div>
               </section>
             ) : (
               <div className="flex flex-col items-center justify-center p-6 text-slate-500 animate-pulse">
