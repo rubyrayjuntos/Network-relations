@@ -143,7 +143,19 @@ export async function fetchOmnipathInteractions(proteins: string[]): Promise<Omn
   }
 }
 
+import { 
+  CURATED_CANCER_GENES, 
+  generateFallbackGeneData, 
+  CuratedGeneData, 
+  BindingSiteInfo, 
+  DruggabilityInfo, 
+  DepMapInfo 
+} from './cancerData';
+
+export type { BindingSiteInfo, DruggabilityInfo, DepMapInfo, CuratedGeneData };
+
 export type ProteinDetails = {
+  symbol: string;
   name: string;
   summary: string;
   go?: {
@@ -152,48 +164,119 @@ export type ProteinDetails = {
     MF?: { term: string }[];
   };
   disease?: { term: string }[];
-  inferredRole?: "oncogene" | "tumor_suppressor" | "unknown";
-  druggable?: boolean;
+  inferredRole: "oncogene" | "tumor_suppressor" | "dual_role" | "essential_regulator" | "unknown";
+  roleDescription?: string;
+  druggable: boolean;
+  druggabilityDetails?: DruggabilityInfo;
+  depMap?: DepMapInfo;
+  bindingSites?: BindingSiteInfo[];
+  pathways?: string[];
   expressionLevel?: number; // Synthetic log2FC expression value (-3.0 to +3.0)
 };
 
 export async function fetchProteinDetails(symbol: string): Promise<ProteinDetails | null> {
+  const upperSymbol = symbol.toUpperCase().trim();
+  const curated = CURATED_CANCER_GENES[upperSymbol];
+
   try {
-    const res = await fetch(`https://mygene.info/v3/query?q=symbol:${symbol}&species=human&fields=go,name,summary,disease,pharos`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data.hits && data.hits.length > 0) {
-      const hit = data.hits[0];
-      
-      // Dynamically infer role based on text mining the summary
-      let inferredRole: "oncogene" | "tumor_suppressor" | "unknown" = "unknown";
-      const text = (hit.summary || "").toLowerCase();
-      if (text.includes("tumor suppressor") || text.includes("suppressor of")) {
-        inferredRole = "tumor_suppressor";
-      } else if (text.includes("oncogene") || text.includes("proto-oncogene")) {
-        inferredRole = "oncogene";
+    const res = await fetch(`https://mygene.info/v3/query?q=symbol:${upperSymbol}&species=human&fields=go,name,summary,disease,pharos,pathway,interpro`);
+    let hit: any = null;
+    if (res.ok) {
+      const data = await res.json();
+      if (data.hits && data.hits.length > 0) {
+        hit = data.hits[0];
       }
-      
-      // Infer druggability (presence of Pharos target data or kinase activity)
-      let druggable = false;
-      if (hit.pharos && hit.pharos.target_id) druggable = true;
-      if (text.includes("kinase") || text.includes("receptor")) druggable = true;
-
-      // Generate synthetic gene expression level (Log2 Fold Change roughly between -3.0 and +3.0)
-      let expressionLevel = 0;
-      const sumHash = symbol.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-      expressionLevel = ((sumHash % 100) / 100) * 6 - 3;
-
-      return {
-        ...hit,
-        inferredRole,
-        druggable,
-        expressionLevel
-      } as ProteinDetails;
     }
-    return null;
+
+    // Generate synthetic gene expression level (Log2 Fold Change roughly between -3.0 and +3.0)
+    let expressionLevel = 0;
+    const sumHash = upperSymbol.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+    expressionLevel = ((sumHash % 100) / 100) * 6 - 3;
+
+    if (curated) {
+      // Merge curated with live MyGene GO/disease terms
+      const details: ProteinDetails = {
+        symbol: upperSymbol,
+        name: hit?.name || curated.name,
+        summary: hit?.summary || curated.roleDescription,
+        go: hit?.go,
+        disease: hit?.disease,
+        inferredRole: curated.role,
+        roleDescription: curated.roleDescription,
+        druggable: curated.druggability.isDruggable,
+        druggabilityDetails: curated.druggability,
+        depMap: curated.depMap,
+        bindingSites: curated.bindingSites,
+        pathways: curated.pathways,
+        expressionLevel
+      };
+      return details;
+    }
+
+    if (hit) {
+      const fallback = generateFallbackGeneData(upperSymbol, hit);
+      return {
+        symbol: upperSymbol,
+        name: hit.name || fallback.name,
+        summary: hit.summary || fallback.roleDescription,
+        go: hit.go,
+        disease: hit.disease,
+        inferredRole: fallback.role,
+        roleDescription: fallback.roleDescription,
+        druggable: fallback.druggability.isDruggable,
+        druggabilityDetails: fallback.druggability,
+        depMap: fallback.depMap,
+        bindingSites: fallback.bindingSites,
+        pathways: fallback.pathways,
+        expressionLevel
+      };
+    }
+
+    // If MyGene failed to return a hit, use purely fallback curated heuristics
+    const fallback = generateFallbackGeneData(upperSymbol);
+    return {
+      symbol: upperSymbol,
+      name: fallback.name,
+      summary: fallback.roleDescription,
+      inferredRole: fallback.role,
+      roleDescription: fallback.roleDescription,
+      druggable: fallback.druggability.isDruggable,
+      druggabilityDetails: fallback.druggability,
+      depMap: fallback.depMap,
+      bindingSites: fallback.bindingSites,
+      pathways: fallback.pathways,
+      expressionLevel
+    };
   } catch (e) {
     console.error("MyGene error:", e);
-    return null;
+    if (curated) {
+      return {
+        symbol: upperSymbol,
+        name: curated.name,
+        summary: curated.roleDescription,
+        inferredRole: curated.role,
+        roleDescription: curated.roleDescription,
+        druggable: curated.druggability.isDruggable,
+        druggabilityDetails: curated.druggability,
+        depMap: curated.depMap,
+        bindingSites: curated.bindingSites,
+        pathways: curated.pathways,
+        expressionLevel: 0
+      };
+    }
+    const fallback = generateFallbackGeneData(upperSymbol);
+    return {
+      symbol: upperSymbol,
+      name: fallback.name,
+      summary: fallback.roleDescription,
+      inferredRole: fallback.role,
+      roleDescription: fallback.roleDescription,
+      druggable: fallback.druggability.isDruggable,
+      druggabilityDetails: fallback.druggability,
+      depMap: fallback.depMap,
+      bindingSites: fallback.bindingSites,
+      pathways: fallback.pathways,
+      expressionLevel: 0
+    };
   }
 }
