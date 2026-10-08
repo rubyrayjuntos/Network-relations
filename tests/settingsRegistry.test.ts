@@ -55,6 +55,13 @@ test("preference validation rejects unknown keys and invalid scores", () => {
   assert.equal(badRange.ok, false);
   const badHub = validatePreferences({ ...defaultPreferences(), hubColors: { ...defaultPreferences().hubColors, fill: "#e11d48" } });
   assert.equal(badHub.ok, false);
+  const emptyContext = validatePreferences({ ...defaultPreferences(), context: "  " });
+  assert.equal(emptyContext.ok, false);
+  const numericContext = validatePreferences({ ...defaultPreferences(), context: 12 });
+  assert.equal(numericContext.ok, false);
+  const keptContext = validatePreferences({ ...defaultPreferences(), context: " Lung " });
+  assert.equal(keptContext.ok, true);
+  if (keptContext.ok) assert.equal(keptContext.value.context, "Lung");
 });
 
 test("operator readout reports secret presence without the secret", () => {

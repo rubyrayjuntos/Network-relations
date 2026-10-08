@@ -365,6 +365,10 @@ export function validatePreferences(input: unknown): { ok: true; value: Preferen
   merged.zeta = zeta;
   merged.bloomScale = bloom;
   if (!["chronos", "expression", "roles"].includes(merged.visualMode)) return { ok: false, error: "visualMode is invalid" };
+  if (typeof merged.context !== "string" || merged.context.trim() === "") {
+    return { ok: false, error: "context must be a non-empty string" };
+  }
+  merged.context = merged.context.trim();
   if (!Array.isArray(merged.selectedPathways)) return { ok: false, error: "selectedPathways must be a list" };
   if (!hexList(merged.chronosRange, merged.chronosDomain.length) || !hexList(merged.expressionRange, merged.expressionDomain.length) || !hexList(merged.searchHighlight)) {
     return { ok: false, error: "color lists must be #rrggbb" };
