@@ -1,146 +1,139 @@
-import { betweennessCentrality } from './graph';
+import type { ContextInfo, GeneContextMeasurement } from './measurements';
+import type { OmnipathInteraction } from './omnipath';
+import { defaultPreferences, setting } from './settingsRegistry';
 
-export const INITIAL_SEEDS: Record<string, string[]> = {
-  "RAS_MAPK": ["KRAS", "RAF1", "MAPK1"],
-  "PI3K_AKT": ["PIK3CA", "AKT1", "PTEN"],
-  "Cell_Cycle": ["TP53", "RB1", "CDK4"],
-  "Apoptosis": ["BAX", "BCL2", "CASP3"],
-  "Angiogenesis": ["VEGFA", "KDR", "HIF1A"]
-};
+export { DEFAULT_SEEDS as INITIAL_SEEDS } from './settingsRegistry';
 
-export type GraphData = { nodes: string[], edges: [string, string][] };
+export type StringEdge = [string, string, number | null];
+export type GraphData = { nodes: string[], edges: StringEdge[] };
+export type StringFetch = { graph: GraphData; error: string | null };
 
-export async function fetchStringNetwork(proteins: string[], limit: number = 25): Promise<GraphData> {
-  if (!proteins || proteins.length === 0) return { nodes: [], edges: [] };
-  
+export function stringCombinedScore(value: unknown): number | null {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw < 0) return null;
+  const scaled = raw <= 1 ? raw * 1000 : raw;
+  return Math.round(scaled);
+}
+
+export async function fetchStringNetwork(
+  proteins: string[],
+  limit: number = defaultPreferences().stringNetworkLimit,
+  species: string = defaultPreferences().stringSpecies,
+  requiredScore: number = defaultPreferences().stringRequiredScore
+): Promise<StringFetch> {
+  if (!proteins || proteins.length === 0) return { graph: { nodes: [], edges: [] }, error: null };
+  const networkUrl = String(setting("source.string.networkUrl").default);
   try {
     const params = new URLSearchParams({
-      identifiers: proteins.join('\r'),
-      species: '9606',
-      required_score: '700'
+      identifiers: proteins.join(String(setting("source.string.identifierDelimiter").default)),
+      species,
+      required_score: String(requiredScore)
     });
-    
-    // Using interaction endpoint to get edges
-    const res = await fetch(`https://string-db.org/api/json/network?${params}`);
-    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const res = await fetch(`${networkUrl}?${params}`);
+    if (!res.ok) throw new Error(`STRING request failed (${res.status})`);
     const data = await res.json();
-    
     const nodesSet = new Set<string>();
-    const edges: [string, string][] = [];
-    
+    const edges: StringEdge[] = [];
     data.forEach((row: any) => {
       const u = row.preferredName_A;
       const v = row.preferredName_B;
       if (u && v) {
         nodesSet.add(u);
         nodesSet.add(v);
-        edges.push([u, v]);
+        edges.push([u, v, stringCombinedScore(row.score)]);
       }
     });
-    
     let nodes = Array.from(nodesSet);
-    
     if (nodes.length > limit) {
-      // Basic degree centrality for fast pruning if network is too large
       const degrees: Record<string, number> = {};
       nodes.forEach(n => degrees[n] = 0);
-      edges.forEach(([u, v]) => { degrees[u]++; degrees[v]++; });
-      
+      edges.forEach(([u, v]) => { degrees[u] = (degrees[u] ?? 0) + 1; degrees[v] = (degrees[v] ?? 0) + 1; });
       nodes.sort((a, b) => degrees[b] - degrees[a]);
       nodes = nodes.slice(0, limit);
       const topNodesSet = new Set(nodes);
-      const prunedEdges = edges.filter(([u, v]) => topNodesSet.has(u) && topNodesSet.has(v));
-      return { nodes, edges: prunedEdges };
+      return { graph: { nodes, edges: edges.filter(([u, v]) => topNodesSet.has(u) && topNodesSet.has(v)) }, error: null };
     }
-    
-    return { nodes, edges };
+    return { graph: { nodes, edges }, error: null };
   } catch (e) {
-    console.error("STRING error:", e);
-    return { nodes: proteins.slice(0, limit), edges: [] };
+    const message = e instanceof Error ? e.message : "STRING request failed";
+    return { graph: { nodes: proteins.slice(0, limit), edges: [] }, error: message };
   }
 }
 
-export async function fetchInteractors(protein: string, limit: number = 10): Promise<GraphData> {
+export async function fetchInteractors(
+  protein: string,
+  limit: number = defaultPreferences().stringPartnerLimit,
+  species: string = defaultPreferences().stringSpecies,
+  requiredScore: number = defaultPreferences().stringPartnerScore
+): Promise<StringFetch> {
+  const partnersUrl = String(setting("source.string.partnersUrl").default);
   try {
     const params = new URLSearchParams({
       identifiers: protein,
-      species: '9606',
+      species,
       limit: limit.toString(),
-      required_score: '800'
+      required_score: String(requiredScore)
     });
-    
-    const res = await fetch(`https://string-db.org/api/json/interaction_partners?${params}`);
-    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const res = await fetch(`${partnersUrl}?${params}`);
+    if (!res.ok) throw new Error(`STRING request failed (${res.status})`);
     const data = await res.json();
-    
     const nodesSet = new Set<string>([protein]);
-    const edges: [string, string][] = [];
-    
+    const edges: StringEdge[] = [];
     data.forEach((row: any) => {
       const u = row.preferredName_A;
       const v = row.preferredName_B;
       if (u && v) {
         nodesSet.add(u);
         nodesSet.add(v);
-        edges.push([u, v]);
+        edges.push([u, v, stringCombinedScore(row.score)]);
       }
     });
-    
-    return { nodes: Array.from(nodesSet), edges };
+    return { graph: { nodes: Array.from(nodesSet), edges }, error: null };
   } catch (e) {
-    console.error("STRING interaction error:", e);
-    return { nodes: [protein], edges: [] };
+    const message = e instanceof Error ? e.message : "STRING request failed";
+    return { graph: { nodes: [protein], edges: [] }, error: message };
   }
 }
 
-export type OmnipathInteraction = {
-  source: string;
-  target: string;
-  is_stimulation: boolean;
-  is_inhibition: boolean;
-};
+export type { OmnipathInteraction } from './omnipath';
 
-export async function fetchOmnipathInteractions(proteins: string[]): Promise<OmnipathInteraction[]> {
-  if (!proteins || proteins.length === 0) return [];
-  
+export type OmnipathFetchResult =
+  | { ok: true; datasets: string[]; interactions: OmnipathInteraction[] }
+  | { ok: false; error: string };
+
+export async function fetchOmnipathInteractions(proteins: string[], datasets: string[]): Promise<OmnipathFetchResult> {
+  if (datasets.length === 0) return { ok: true, datasets: [], interactions: [] };
+  if (!proteins || proteins.length === 0) return { ok: false, error: "partners is required" };
   try {
-    // Omnipath API supports GET with partners list
-    const params = new URLSearchParams({
-      genesymbols: '1',
-      format: 'json',
-      partners: proteins.join(','),
-      datasets: 'omnipath,pathwayextra,kinaseextra,ligrecextra'
-    });
-    
-    const res = await fetch(`https://omnipathdb.org/interactions?${params}`);
-    if (!res.ok) throw new Error(`Omnipath error! status: ${res.status}`);
-    
-    const data = await res.json();
-    
-    // Filter to only edges where BOTH source and target are in our network
-    const proteinSet = new Set(proteins);
-    
-    const filtered: OmnipathInteraction[] = [];
-    
-    for (const row of data) {
-      const source = row.source_genesymbol;
-      const target = row.target_genesymbol;
-      
-      if (source && target && proteinSet.has(source) && proteinSet.has(target)) {
-        filtered.push({
-          source,
-          target,
-          is_stimulation: row.is_stimulation === true || row.consensus_stimulation === true,
-          is_inhibition: row.is_inhibition === true || row.consensus_inhibition === true
-        });
-      }
+    const params = new URLSearchParams({ partners: proteins.join(","), datasets: datasets.join(",") });
+    const res = await fetch(`${setting("source.omnipath.proxyPath").default}?${params}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { ok: false, error: body.error || `OmniPath proxy failed (${res.status})` };
     }
-    
-    return filtered;
+    return { ok: true, datasets: body.datasets ?? [], interactions: body.interactions ?? [] };
   } catch (e) {
-    console.error("Omnipath error:", e);
-    return [];
+    return { ok: false, error: e instanceof Error ? e.message : "OmniPath proxy failed" };
   }
+}
+
+export async function fetchContexts(): Promise<{ release: string; contexts: ContextInfo[] } | { error: string }> {
+  const res = await fetch("/api/contexts");
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: body.error || "DepMap contexts are unavailable" };
+  return body;
+}
+
+export async function fetchMeasurements(genes: string[], context: string): Promise<{
+  release: string;
+  context: ContextInfo;
+  genes: Record<string, GeneContextMeasurement | null>;
+} | { error: string }> {
+  const params = new URLSearchParams({ genes: genes.join(","), context });
+  const res = await fetch(`/api/measurements?${params}`);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: body.error || "DepMap measurements are unavailable" };
+  return body;
 }
 
 import { 
@@ -171,27 +164,52 @@ export type ProteinDetails = {
   depMap?: DepMapInfo;
   bindingSites?: BindingSiteInfo[];
   pathways?: string[];
-  expressionLevel?: number; // Synthetic log2FC expression value (-3.0 to +3.0)
+  mygeneError?: boolean;
 };
 
-export async function fetchProteinDetails(symbol: string): Promise<ProteinDetails | null> {
+function uncuratedDetails(symbol: string, hit?: any): ProteinDetails {
+  const fallback = generateFallbackGeneData(symbol, hit);
+  return {
+    symbol,
+    name: hit?.name || fallback.name,
+    summary: hit?.summary || "",
+    go: hit?.go,
+    disease: hit?.disease,
+    inferredRole: fallback.role,
+    druggable: false,
+    pathways: fallback.pathways,
+  };
+}
+
+function curatedFailure(symbol: string, curated: CuratedGeneData): ProteinDetails {
+  return {
+    symbol,
+    name: curated.name,
+    summary: "",
+    inferredRole: "unknown",
+    roleDescription: curated.roleDescription,
+    druggable: curated.druggability.isDruggable,
+    druggabilityDetails: curated.druggability,
+    bindingSites: curated.bindingSites,
+    pathways: curated.pathways,
+    mygeneError: true,
+  };
+}
+
+export async function fetchProteinDetails(symbol: string, fields: string[] = defaultPreferences().mygeneFields): Promise<ProteinDetails | null> {
   const upperSymbol = symbol.toUpperCase().trim();
   const curated = CURATED_CANCER_GENES[upperSymbol];
 
   try {
-    const res = await fetch(`https://mygene.info/v3/query?q=symbol:${upperSymbol}&species=human&fields=go,name,summary,disease,pharos,pathway,interpro`);
+    const res = await fetch(`${setting("source.mygene.url").default}?q=symbol:${upperSymbol}&species=${setting("source.mygene.species").default}&fields=${fields.join(",")}`);
     let hit: any = null;
-    if (res.ok) {
-      const data = await res.json();
-      if (data.hits && data.hits.length > 0) {
-        hit = data.hits[0];
-      }
+    if (!res.ok) {
+      return curated ? curatedFailure(upperSymbol, curated) : { ...uncuratedDetails(upperSymbol), mygeneError: true, inferredRole: "unknown" as const, druggable: false, summary: "" };
     }
-
-    // Generate synthetic gene expression level (Log2 Fold Change roughly between -3.0 and +3.0)
-    let expressionLevel = 0;
-    const sumHash = upperSymbol.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    expressionLevel = ((sumHash % 100) / 100) * 6 - 3;
+    const data = await res.json();
+    if (data.hits && data.hits.length > 0) {
+      hit = data.hits[0];
+    }
 
     if (curated) {
       // Merge curated with live MyGene GO/disease terms
@@ -205,78 +223,20 @@ export async function fetchProteinDetails(symbol: string): Promise<ProteinDetail
         roleDescription: curated.roleDescription,
         druggable: curated.druggability.isDruggable,
         druggabilityDetails: curated.druggability,
-        depMap: curated.depMap,
         bindingSites: curated.bindingSites,
         pathways: curated.pathways,
-        expressionLevel
       };
       return details;
     }
 
     if (hit) {
-      const fallback = generateFallbackGeneData(upperSymbol, hit);
-      return {
-        symbol: upperSymbol,
-        name: hit.name || fallback.name,
-        summary: hit.summary || fallback.roleDescription,
-        go: hit.go,
-        disease: hit.disease,
-        inferredRole: fallback.role,
-        roleDescription: fallback.roleDescription,
-        druggable: fallback.druggability.isDruggable,
-        druggabilityDetails: fallback.druggability,
-        depMap: fallback.depMap,
-        bindingSites: fallback.bindingSites,
-        pathways: fallback.pathways,
-        expressionLevel
-      };
+      return uncuratedDetails(upperSymbol, hit);
     }
 
-    // If MyGene failed to return a hit, use purely fallback curated heuristics
-    const fallback = generateFallbackGeneData(upperSymbol);
-    return {
-      symbol: upperSymbol,
-      name: fallback.name,
-      summary: fallback.roleDescription,
-      inferredRole: fallback.role,
-      roleDescription: fallback.roleDescription,
-      druggable: fallback.druggability.isDruggable,
-      druggabilityDetails: fallback.druggability,
-      depMap: fallback.depMap,
-      bindingSites: fallback.bindingSites,
-      pathways: fallback.pathways,
-      expressionLevel
-    };
+    return uncuratedDetails(upperSymbol);
   } catch (e) {
     console.error("MyGene error:", e);
-    if (curated) {
-      return {
-        symbol: upperSymbol,
-        name: curated.name,
-        summary: curated.roleDescription,
-        inferredRole: curated.role,
-        roleDescription: curated.roleDescription,
-        druggable: curated.druggability.isDruggable,
-        druggabilityDetails: curated.druggability,
-        depMap: curated.depMap,
-        bindingSites: curated.bindingSites,
-        pathways: curated.pathways,
-        expressionLevel: 0
-      };
-    }
-    const fallback = generateFallbackGeneData(upperSymbol);
-    return {
-      symbol: upperSymbol,
-      name: fallback.name,
-      summary: fallback.roleDescription,
-      inferredRole: fallback.role,
-      roleDescription: fallback.roleDescription,
-      druggable: fallback.druggability.isDruggable,
-      druggabilityDetails: fallback.druggability,
-      depMap: fallback.depMap,
-      bindingSites: fallback.bindingSites,
-      pathways: fallback.pathways,
-      expressionLevel: 0
-    };
+    if (curated) return curatedFailure(upperSymbol, curated);
+    return { ...uncuratedDetails(upperSymbol), mygeneError: true, inferredRole: "unknown" as const, druggable: false, summary: "" };
   }
 }

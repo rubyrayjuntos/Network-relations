@@ -1,12 +1,10 @@
+import type { Preferences } from "./settingsRegistry";
+
+export type { Preferences };
+
 export type User = {
   id: number;
   username: string;
-};
-
-export type Preferences = {
-  zeta: number;
-  bloomScale: number;
-  selectedPathways: string[];
 };
 
 export const api = {
@@ -53,10 +51,23 @@ export const api = {
   },
 
   async savePreferences(prefs: Preferences) {
-    await fetch('/api/preferences', {
+    const res = await fetch('/api/preferences', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(prefs),
     });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Could not save preferences');
+    }
+  },
+
+  async getOperator(): Promise<Record<string, unknown>> {
+    const res = await fetch('/api/operator');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Operator readout failed');
+    }
+    return res.json();
   }
 };

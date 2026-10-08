@@ -5,9 +5,27 @@ import fs from "fs/promises";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
+import dotenv from "dotenv";
+import { mountScienceRoutes } from "./src/lib/scienceRoutes";
+import type { MeasurementCache } from "./src/lib/measurements";
+import { defaultPreferences, mergePreferences, operatorReadout, validatePreferences, setting } from "./src/lib/settingsRegistry";
 
-const JWT_SECRET = process.env.JWT_SECRET || "super-secret-jwt-key-change-in-production";
-const DB_FILE = "./database.json";
+dotenv.config();
+dotenv.config({ path: ".env.local", override: true });
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is required. Add it to .env.local before starting the server.");
+}
+
+const HOST = process.env.HOST || String(setting("operator.host").default);
+const DB_FILE = String(setting("operator.databasePath").default);
+
+const authCookie = {
+  httpOnly: Boolean(setting("operator.cookieHttpOnly").default),
+  sameSite: setting("operator.cookieSameSite").default as "lax",
+  secure: process.env.NODE_ENV === "production",
+};
 
 // Simple JSON Database
 let db = {
@@ -29,11 +47,22 @@ async function saveDb() {
   await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2));
 }
 
+async function loadMeasurementCache(): Promise<MeasurementCache | null> {
+  try {
+    const raw = await fs.readFile(path.join(process.cwd(), "data/cache/measurements.json"), "utf8");
+    return JSON.parse(raw) as MeasurementCache;
+  } catch {
+    console.warn("DepMap cache is not built. Measurement routes will return 503 until npm run cache-depmap.");
+    return null;
+  }
+}
+  
 async function startServer() {
   await loadDb();
-  
+  const measurementCache = await loadMeasurementCache();
+
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || Number(setting("operator.port").default);
 
   app.use(express.json());
   app.use(cookieParser());
@@ -66,17 +95,12 @@ async function startServer() {
       db.users.push({ id: newId, username, password: hashedPassword });
       
       // Default preferences
-      db.preferences.push({
-        user_id: newId,
-        zeta: 1.0,
-        bloomScale: 1.8,
-        selectedPathways: ["RAS_MAPK", "PI3K_AKT", "Cell_Cycle", "Apoptosis", "Angiogenesis"]
-      });
+      db.preferences.push({ user_id: newId, ...defaultPreferences() });
       
       await saveDb();
 
       const token = jwt.sign({ id: newId, username }, JWT_SECRET, { expiresIn: "24h" });
-      res.cookie("token", token, { httpOnly: true, secure: process.env.NODE_ENV === "production" });
+      res.cookie("token", token, authCookie);
       res.json({ id: newId, username });
     } catch (error: any) {
       res.status(500).json({ error: "Internal server error" });
@@ -92,12 +116,12 @@ async function startServer() {
     }
 
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: "24h" });
-    res.cookie("token", token, { httpOnly: true, secure: process.env.NODE_ENV === "production" });
+    res.cookie("token", token, authCookie);
     res.json({ id: user.id, username: user.username });
   });
 
   app.post("/api/logout", (req, res) => {
-    res.clearCookie("token");
+    res.clearCookie("token", authCookie);
     res.json({ success: true });
   });
 
@@ -108,29 +132,34 @@ async function startServer() {
   app.get("/api/preferences", authenticateToken, (req: any, res: any) => {
     const prefs = db.preferences.find(p => p.user_id === req.user.id);
     if (prefs) {
-      res.json({
-        zeta: prefs.zeta,
-        bloomScale: prefs.bloomScale,
-        selectedPathways: prefs.selectedPathways
-      });
+      res.json(mergePreferences(prefs));
     } else {
       res.status(404).json({ error: "Preferences not found" });
     }
   });
 
+  app.get("/api/operator", authenticateToken, (_req: any, res: any) => {
+    res.json(operatorReadout({
+      env: process.env,
+      cacheLoaded: measurementCache != null,
+      cacheRelease: measurementCache?.release ?? null,
+    }));
+  });
+
   app.post("/api/preferences", authenticateToken, async (req: any, res: any) => {
-    const { zeta, bloomScale, selectedPathways } = req.body;
+    const checked = validatePreferences(req.body);
+    if (checked.ok === false) return res.status(400).json({ error: checked.error });
     const prefIndex = db.preferences.findIndex(p => p.user_id === req.user.id);
-    
     if (prefIndex >= 0) {
-      db.preferences[prefIndex] = { ...db.preferences[prefIndex], zeta, bloomScale, selectedPathways };
+      db.preferences[prefIndex] = { ...db.preferences[prefIndex], ...checked.value };
     } else {
-      db.preferences.push({ user_id: req.user.id, zeta, bloomScale, selectedPathways });
+      db.preferences.push({ user_id: req.user.id, ...checked.value });
     }
-    
     await saveDb();
     res.json({ success: true });
   });
+
+  mountScienceRoutes(app, measurementCache);
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
@@ -147,8 +176,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
   });
 }
 

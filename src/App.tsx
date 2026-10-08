@@ -6,22 +6,46 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import * as d3 from 'd3';
 import html2canvas from 'html2canvas';
-import { RefreshCw, Database, LogOut, X, Search, Plus, Loader2, Flame, FastForward, Activity, Sparkles, Camera, Check, Download } from 'lucide-react';
+import { Database, LogOut, Loader2, Camera, Check, Download, Settings } from 'lucide-react';
 import { Complex, cExp, cAbs, poincareTranslation, hashString } from './lib/math';
 import { betweennessCentrality, calculateNetworkMetrics } from './lib/graph';
 import { 
   INITIAL_SEEDS, fetchStringNetwork, fetchInteractors, GraphData, fetchProteinDetails, ProteinDetails,
-  fetchOmnipathInteractions, OmnipathInteraction
+  fetchOmnipathInteractions, fetchContexts, fetchMeasurements, OmnipathInteraction
 } from './lib/api';
 import { cn } from './lib/utils';
-import { BooleanNetwork, SimState } from './lib/simulation';
-import { api, User, Preferences } from './lib/auth';
+import { api, User } from './lib/auth';
 import { Auth } from './components/Auth';
 import { ProteinInfoPanel } from './components/ProteinInfoPanel';
 import { GeneSearch } from './components/GeneSearch';
+import { SettingsPanel } from './components/SettingsPanel';
+import { PAN_CANCER_ID, PAN_CANCER_LABEL, type GeneContextMeasurement } from './lib/measurements';
+import { buildViewExport, signsForEdge } from './lib/exportView';
+import { SETTINGS, defaultPreferences, edgeWidth, validatePreferences, type Preferences } from './lib/settingsRegistry';
 
-const ZETA_DEFAULT = 1.0;
-const ALL_PATHWAYS = Object.keys(INITIAL_SEEDS);
+function releaseToken(release: string | null): string {
+  if (release == null) return "cache not built";
+  if (release.length === 0) return "release unavailable";
+  return release;
+}
+
+function pngStamp(prefs: Preferences, contextLabel: string, release: string | null, date: string) {
+  return `POINCARÉ DISC • ${prefs.visualMode} • ${contextLabel} • STRING ${prefs.stringSpecies} score≥${prefs.stringRequiredScore} partners≥${prefs.stringPartnerScore} • DepMap ${releaseToken(release)} • ${date}`;
+}
+
+function edgeRegulation(interactions: OmnipathInteraction[], source: string, target: string): "stimulation" | "inhibition" | "both" | "none" {
+  const signs = signsForEdge(source, target, interactions);
+  let stimulation = false;
+  let inhibition = false;
+  for (const sign of signs) {
+    if (sign.is_stimulation) stimulation = true;
+    if (sign.is_inhibition) inhibition = true;
+  }
+  if (stimulation && inhibition) return "both";
+  if (stimulation) return "stimulation";
+  if (inhibition) return "inhibition";
+  return "none";
+}
 
 function getPrimaryCoords(centralityDict: Record<string, number>, zeta: number, selectedPathways: string[]) {
   const coords: Record<string, Complex> = {};
@@ -91,8 +115,17 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
-  const [zeta, setZeta] = useState(ZETA_DEFAULT);
-  const [bloomScale, setBloomScale] = useState(1.8);
+  const [applied, setApplied] = useState<Preferences>(() => defaultPreferences());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsPending, setSettingsPending] = useState(false);
+  const [operatorInfo, setOperatorInfo] = useState<Record<string, unknown> | null>(null);
+  const [operatorError, setOperatorError] = useState<string | null>(null);
+  const [stringError, setStringError] = useState<string | null>(null);
+  const lastGoodGraphs = useRef<Record<string, GraphData> | null>(null);
+  const stringBootstrapped = useRef(false);
+  const [zeta, setZeta] = useState(defaultPreferences().zeta);
+  const [bloomScale, setBloomScale] = useState(defaultPreferences().bloomScale);
   const [primaryCentrality, setPrimaryCentrality] = useState<Record<string, number>>({});
   const [secondaryGraphs, setSecondaryGraphs] = useState<Record<string, GraphData>>({});
   const [globalMetrics, setGlobalMetrics] = useState<{ nodes: number, edges: number, avgClusteringCoefficient: number, avgPathLength: number } | null>(null);
@@ -103,19 +136,24 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState<React.ReactNode>("STRING Network Integration Active.");
   
   const [omnipathEdges, setOmnipathEdges] = useState<OmnipathInteraction[]>([]);
-
-  // Boolean Network Simulation Engine
-  const [simEngine, setSimEngine] = useState<BooleanNetwork | null>(null);
-  const [simState, setSimState] = useState<SimState>({});
-  const [knockouts, setKnockouts] = useState<Set<string>>(new Set());
-  const [isSimRunning, setIsSimRunning] = useState(false);
-  const [isKnockoutMode, setIsKnockoutMode] = useState(false);
-  const [simSpeed, setSimSpeed] = useState(500);
-  
-  // Visualization Mode: 'roles' (biological categories), 'expression' (RNA Log2FC), or 'hotspot' (50-tick activation frequency)
-  const [visualMode, setVisualMode] = useState<'roles' | 'expression' | 'hotspot'>('roles');
-  const [activationFrequencies, setActivationFrequencies] = useState<Record<string, number>>({});
-  const [simTickCount, setSimTickCount] = useState<number>(0);
+  const [omnipathError, setOmnipathError] = useState<string | null>(null);
+  const [omnipathForKey, setOmnipathForKey] = useState<string | null>(null);
+  const omnipathFetchGen = useRef(0);
+  const savedPathwaysRef = useRef<string[] | null>(null);
+  const [prefsHydrated, setPrefsHydrated] = useState(false);
+  const [contextId, setContextId] = useState(PAN_CANCER_ID);
+  const [contexts, setContexts] = useState<{ id: string; label: string }[]>([
+    { id: PAN_CANCER_ID, label: PAN_CANCER_LABEL },
+  ]);
+  const [depmapRelease, setDepmapRelease] = useState<string | null>(null);
+  const [measurements, setMeasurements] = useState<Record<string, GeneContextMeasurement | null>>({});
+  const [measurementError, setMeasurementError] = useState<string | null>(null);
+  const [visualMode, setVisualMode] = useState<Preferences["visualMode"]>("chronos");
+  const effective: Preferences = { ...applied, zeta, bloomScale, selectedPathways, context: contextId, visualMode };
+  const prefsRef = useRef(effective);
+  prefsRef.current = effective;
+  const graphsRef = useRef(secondaryGraphs);
+  graphsRef.current = secondaryGraphs;
 
   const [loadingString, setLoadingString] = useState(false);
   const [expandingNode, setExpandingNode] = useState<string | null>(null);
@@ -167,37 +205,58 @@ export default function App() {
       if (u) {
         api.getPreferences().then(prefs => {
           if (prefs) {
-            setZeta(prefs.zeta);
-            setBloomScale(prefs.bloomScale);
-            // Only restore if valid
-            if (prefs.selectedPathways && prefs.selectedPathways.length > 0) {
-              setSelectedPathways(prefs.selectedPathways);
+            const checked = validatePreferences(prefs);
+            const next = checked.ok ? checked.value : defaultPreferences();
+            setApplied(next);
+            setZeta(next.zeta);
+            setBloomScale(next.bloomScale);
+            if (next.selectedPathways.length > 0) {
+              savedPathwaysRef.current = next.selectedPathways;
+              setSelectedPathways(next.selectedPathways);
             }
+            setContextId(next.context);
+            setVisualMode(next.visualMode);
           }
-        }).catch(console.error);
+          setPrefsHydrated(true);
+        }).catch(() => setPrefsHydrated(true));
+      } else {
+        setPrefsHydrated(true);
       }
       setAuthLoading(false);
     }).catch(err => {
       console.error(err);
+      setPrefsHydrated(true);
       setAuthLoading(false);
     });
   }, []);
 
-  // Save preferences when they change (debounced)
+  // Save preferences when they change (debounced). Wait until the saved
+  // selection has been restored so the seed fetch cannot overwrite it.
+  const prefsKey = JSON.stringify(effective);
   useEffect(() => {
-    if (!user) return;
+    if (!user || !prefsHydrated) return;
     const timeout = setTimeout(() => {
-      api.savePreferences({ zeta, bloomScale, selectedPathways });
+      api.savePreferences(prefsRef.current).catch(() => {});
     }, 1000);
     return () => clearTimeout(timeout);
-  }, [zeta, bloomScale, selectedPathways, user]);
+  }, [prefsKey, user, prefsHydrated]);
 
-  // Initial load of STRING data
   useEffect(() => {
-    if (user && Object.keys(secondaryGraphs).length === 0) {
-      handleRefreshString();
-    }
-  }, [user]);
+    if (!settingsOpen || !user) return;
+    api.getOperator().then(info => {
+      setOperatorInfo(info);
+      setOperatorError(null);
+    }).catch(error => {
+      setOperatorError(error instanceof Error ? error.message : "Operator readout failed");
+    });
+  }, [settingsOpen, user]);
+
+  // Initial load of STRING data waits until saved preferences are restored.
+  useEffect(() => {
+    if (!user || !prefsHydrated || stringBootstrapped.current) return;
+    stringBootstrapped.current = true;
+    handleRefreshString();
+  }, [user, prefsHydrated]);
 
   // Setup D3 Zoom
   useEffect(() => {
@@ -221,7 +280,7 @@ export default function App() {
   // Fetch protein details when active
   useEffect(() => {
     if (activeNode && !proteinDetailsCache[activeNode]) {
-      fetchProteinDetails(activeNode).then(details => {
+      fetchProteinDetails(activeNode, prefsRef.current.mygeneFields).then(details => {
         if (details) {
           setProteinDetailsCache(prev => ({ ...prev, [activeNode]: details }));
         }
@@ -233,10 +292,17 @@ export default function App() {
     // Merge all currently visible networks to calculate true network centrality
     const allNodes = new Set<string>();
     const allEdges: [string, string][] = [];
+    const seenEdges = new Set<string>();
     
     Object.values(graphs).forEach(G => {
       G.nodes.forEach(n => allNodes.add(n));
-      G.edges.forEach(e => allEdges.push(e));
+      G.edges.forEach(([u, v]) => {
+        if (u === v) return;
+        const key = u < v ? `${u}|${v}` : `${v}|${u}`;
+        if (seenEdges.has(key)) return;
+        seenEdges.add(key);
+        allEdges.push([u, v]);
+      });
     });
     
     if (allNodes.size > 0) {
@@ -264,105 +330,128 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    if (isSimRunning && simEngine) {
-      interval = setInterval(() => {
-        const next = simEngine.tick();
-        setSimState(next);
-        setActivationFrequencies(simEngine.getActivationFrequencies());
-        setSimTickCount(simEngine.tickCount);
-      }, simSpeed);
-    }
-    return () => clearInterval(interval);
-  }, [isSimRunning, simEngine, simSpeed]);
-
-  const handleToggleSim = () => {
-    if (isSimRunning) {
-      setIsSimRunning(false);
-      setStatusMsg("Simulation Paused.");
-    } else {
-      let engine = simEngine;
-      if (!engine) {
-        const nodes = Object.keys(mappedSecCoords);
-        const edges = uniqueEdges.map(([u, v]) => [u, v] as [string, string]);
-        engine = new BooleanNetwork(nodes, edges, omnipathEdges);
-        setSimEngine(engine);
-        setSimState(engine.state);
-        setActivationFrequencies(engine.getActivationFrequencies());
-        setSimTickCount(engine.tickCount);
-      }
-      setIsSimRunning(true);
-      setStatusMsg(<span className="text-amber-400 font-medium">⚡ Boolean Network Simulation Running...</span>);
-    }
-  };
-
-  const handleFastForward50Ticks = () => {
-    let engine = simEngine;
-    if (!engine) {
-      const nodes = Object.keys(mappedSecCoords);
-      const edges = uniqueEdges.map(([u, v]) => [u, v] as [string, string]);
-      engine = new BooleanNetwork(nodes, edges, omnipathEdges);
-      setSimEngine(engine);
-    }
-    for (let i = 0; i < 50; i++) {
-      engine.tick();
-    }
-    setSimState({ ...engine.state });
-    setActivationFrequencies(engine.getActivationFrequencies());
-    setSimTickCount(engine.tickCount);
-    setStatusMsg(<span className="text-rose-400 font-medium">🔥 Advanced 50 simulation ticks — Hotspot heatmap updated.</span>);
-  };
-
-  const handleResetSim = () => {
-    setIsSimRunning(false);
-    const nodes = Object.keys(mappedSecCoords);
-    const edges = uniqueEdges.map(([u, v]) => [u, v] as [string, string]);
-    const engine = new BooleanNetwork(nodes, edges, omnipathEdges);
-    setSimEngine(engine);
-    setSimState(engine.state);
-    setActivationFrequencies(engine.getActivationFrequencies());
-    setSimTickCount(0);
-    setKnockouts(new Set());
-    setStatusMsg("Simulation Reset.");
-  };
-
-  const handleRefreshString = async () => {
+  const handleRefreshString = async (prefs: Preferences = prefsRef.current) => {
     setLoadingString(true);
     try {
       const newGraphs: Record<string, GraphData> = {};
-      for (const [pathway, seeds] of Object.entries(INITIAL_SEEDS)) {
-        newGraphs[pathway] = await fetchStringNetwork(seeds);
+      const errors: string[] = [];
+      let usedPrevious = false;
+      const absorb = (key: string, result: Awaited<ReturnType<typeof fetchStringNetwork>>) => {
+        if (result.error) {
+          errors.push(result.error);
+          const previous = lastGoodGraphs.current?.[key];
+          if (prefs.fallbackStringError === "keep-last-graph" && previous) {
+            newGraphs[key] = previous;
+            usedPrevious = true;
+          } else {
+            newGraphs[key] = result.graph;
+          }
+        } else {
+          newGraphs[key] = result.graph;
+        }
+      };
+      for (const [pathway, seeds] of Object.entries(prefs.initialSeeds)) {
+        absorb(pathway, await fetchStringNetwork(seeds, prefs.stringNetworkLimit, prefs.stringSpecies, prefs.stringRequiredScore));
+      }
+      for (const hub of Object.keys(graphsRef.current)) {
+        if (hub in newGraphs) continue;
+        absorb(hub, await fetchInteractors(hub, prefs.stringExpandLimit, prefs.stringSpecies, prefs.stringPartnerScore));
       }
       setSecondaryGraphs(newGraphs);
       updateGlobalCentrality(newGraphs);
-      setSelectedPathways(Object.keys(newGraphs));
-      setStatusMsg(<span className="text-emerald-600 font-medium">✅ Initial PPI network seeded.</span>);
+      const available = Object.keys(newGraphs);
+      setSelectedPathways(prev => {
+        const preferred = savedPathwaysRef.current ?? prev;
+        savedPathwaysRef.current = null;
+        const kept = preferred.filter(p => available.includes(p));
+        return kept.length > 0 ? kept : available;
+      });
+      if (errors.length > 0) {
+        const note = usedPrevious
+          ? `${errors[0]}. The drawn graph is the previous success.`
+          : errors[0];
+        setStringError(note);
+        setStatusMsg(<span className="text-red-600 font-medium">{note}</span>);
+      } else {
+        lastGoodGraphs.current = newGraphs;
+        setStringError(null);
+        setStatusMsg(<span className="text-emerald-600 font-medium">✅ Initial PPI network seeded.</span>);
+      }
     } catch (e) {
-      setStatusMsg(<span className="text-red-600 font-medium">❌ Failed to fetch STRING data.</span>);
+      const note = e instanceof Error ? e.message : "Failed to fetch STRING data.";
+      setStringError(note);
+      setStatusMsg(<span className="text-red-600 font-medium">{note}</span>);
     } finally {
       setLoadingString(false);
     }
   };
 
   const handleExpandNetwork = async (protein: string) => {
+    const prefs = prefsRef.current;
     setExpandingNode(protein);
     setStatusMsg(`Fetching direct interactors for ${protein}...`);
     try {
-      const newGraph = await fetchInteractors(protein, 15);
+      const result = await fetchInteractors(protein, prefs.stringExpandLimit, prefs.stringSpecies, prefs.stringPartnerScore);
+      if (result.error) {
+        const note = prefs.fallbackStringError === "keep-last-graph" && secondaryGraphs[protein]
+          ? `${result.error}. The drawn graph is the previous success.`
+          : result.error;
+        setStringError(note);
+        setStatusMsg(<span className="text-red-600 font-medium">{note}</span>);
+        if (!(prefs.fallbackStringError === "keep-last-graph" && secondaryGraphs[protein])) {
+          setSecondaryGraphs(prev => ({ ...prev, [protein]: result.graph }));
+        }
+        return;
+      }
+      setStringError(null);
       setSecondaryGraphs(prev => {
-        const next = { ...prev, [protein]: newGraph };
+        const next = { ...prev, [protein]: result.graph };
         updateGlobalCentrality(next);
+        lastGoodGraphs.current = next;
         return next;
       });
       setSelectedPathways(prev => prev.includes(protein) ? prev : [...prev, protein]);
-      setActiveNode(protein); // Switch focus to the new hub
+      setActiveNode(protein);
       setBloomNode(protein);
       setStatusMsg(<span className="text-emerald-600 font-medium">✅ Expanded network for {protein}.</span>);
     } catch (e) {
-      setStatusMsg(<span className="text-red-600 font-medium">❌ Failed to expand network.</span>);
+      const note = e instanceof Error ? e.message : "Failed to expand network.";
+      setStringError(note);
+      setStatusMsg(<span className="text-red-600 font-medium">{note}</span>);
     } finally {
       setExpandingNode(null);
+    }
+  };
+
+  const commitPreferences = async (next: Preferences, refresh: boolean, keepDisc = true) => {
+    const checked = validatePreferences(keepDisc ? { ...next, zeta, bloomScale, selectedPathways, context: contextId, visualMode } : next);
+    if (checked.ok === false) {
+      setSettingsError(checked.error);
+      return;
+    }
+    setSettingsError(null);
+    if (keepDisc) {
+      const allowed = new Set([...Object.keys(checked.value.initialSeeds), ...Object.keys(graphsRef.current)]);
+      checked.value.selectedPathways = checked.value.selectedPathways.filter(pathway => allowed.has(pathway));
+    }
+    setApplied(checked.value);
+    setZeta(checked.value.zeta);
+    setBloomScale(checked.value.bloomScale);
+    setSelectedPathways(checked.value.selectedPathways);
+    setContextId(checked.value.context);
+    setVisualMode(checked.value.visualMode);
+    prefsRef.current = checked.value;
+    try {
+      await api.savePreferences(checked.value);
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : "Could not save preferences");
+      return;
+    }
+    if (!keepDisc) savedPathwaysRef.current = checked.value.selectedPathways;
+    if (refresh) await handleRefreshString(checked.value);
+    if (refresh && activeNode) {
+      const details = await fetchProteinDetails(activeNode, checked.value.mygeneFields);
+      if (details) setProteinDetailsCache(prev => ({ ...prev, [activeNode]: details }));
     }
   };
 
@@ -399,7 +488,7 @@ export default function App() {
       
       // Primary export with html2canvas library
       const canvas = await html2canvas(targetElement, {
-        backgroundColor: '#07090E',
+        backgroundColor: prefsRef.current.background,
         scale: 2, // 2x high resolution for publication and research figures
         useCORS: true,
         logging: false,
@@ -413,12 +502,7 @@ export default function App() {
         ctx.font = 'bold 13px "JetBrains Mono", Menlo, Consolas, monospace';
         ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
         const dateStr = new Date().toISOString().slice(0, 10);
-        const modeLabel = visualMode === 'hotspot' 
-          ? `DYNAMIC 50-TICK HOTSPOT HEATMAP (${hotspotCount} active hotspots)` 
-          : visualMode === 'expression' 
-          ? 'RNA LOG2FC EXPRESSION PROFILE' 
-          : 'ONCOGENIC TAXONOMIC ROLES';
-        const docText = `POINCARÉ DISC CANCER PPI NETWORK • MODE: ${modeLabel} • DATE: ${dateStr}`;
+        const docText = pngStamp(prefsRef.current, contextLabel, depmapRelease, dateStr);
         ctx.fillText(docText, 24, canvas.height - 20);
         ctx.restore();
       }
@@ -426,7 +510,7 @@ export default function App() {
       const dataUrl = canvas.toDataURL('image/png');
       const link = document.createElement('a');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const modeName = visualMode === 'hotspot' ? 'hotspots' : visualMode === 'expression' ? 'expression' : 'roles';
+      const modeName = visualMode === "expression" ? "expression" : visualMode === "chronos" ? "chronos" : "roles";
       link.download = `poincare-disc-${modeName}-${timestamp}.png`;
       link.href = dataUrl;
       document.body.appendChild(link);
@@ -459,14 +543,14 @@ export default function App() {
           canvas.height = height * 2;
           const ctx = canvas.getContext('2d');
           if (ctx) {
-            ctx.fillStyle = '#07090E';
+            ctx.fillStyle = prefsRef.current.background;
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
             
             ctx.font = 'bold 13px "JetBrains Mono", Menlo, Consolas, monospace';
             ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
             const dateStr = new Date().toISOString().slice(0, 10);
-            const docText = `POINCARÉ DISC CANCER PPI NETWORK • MODE: ${visualMode.toUpperCase()} • DATE: ${dateStr}`;
+            const docText = pngStamp(prefsRef.current, contextLabel, depmapRelease, dateStr);
             ctx.fillText(docText, 24, canvas.height - 20);
 
             const dataUrl = canvas.toDataURL('image/png');
@@ -499,11 +583,11 @@ export default function App() {
         g.nodes.forEach(n => set.add(n));
       }
     });
-    Object.values(INITIAL_SEEDS).forEach(seeds => {
+    Object.values(effective.initialSeeds).forEach(seeds => {
       seeds.forEach(s => set.add(s));
     });
     return Array.from(set).sort();
-  }, [secondaryGraphs]);
+  }, [secondaryGraphs, effective.initialSeeds]);
 
   // Compute connected pathways for the active node
   const activeNodePathways = useMemo(() => {
@@ -512,14 +596,16 @@ export default function App() {
     (Object.entries(secondaryGraphs) as [string, GraphData][]).forEach(([pathway, G]) => {
       if (G && G.nodes && G.nodes.includes(activeNode)) pathways.add(pathway);
     });
-    Object.entries(INITIAL_SEEDS).forEach(([pathway, seeds]) => {
+    Object.entries(effective.initialSeeds).forEach(([pathway, seeds]) => {
       if (seeds.includes(activeNode)) pathways.add(pathway);
     });
     if (proteinDetailsCache[activeNode]?.pathways) {
-      proteinDetailsCache[activeNode].pathways!.forEach(p => pathways.add(p));
+      proteinDetailsCache[activeNode].pathways!.forEach(p => {
+        if (secondaryGraphs[p] || effective.initialSeeds[p]) pathways.add(p);
+      });
     }
     return Array.from(pathways);
-  }, [activeNode, secondaryGraphs, proteinDetailsCache]);
+  }, [activeNode, secondaryGraphs, proteinDetailsCache, effective.initialSeeds]);
 
   // Gene Search Handler
   const handleGeneSearch = (query: string) => {
@@ -551,7 +637,7 @@ export default function App() {
           pathwaysFound.add(p);
         }
       });
-      Object.entries(INITIAL_SEEDS).forEach(([p, seeds]) => {
+      Object.entries(effective.initialSeeds).forEach(([p, seeds]) => {
         if (seeds.some(s => s.toUpperCase() === clean)) {
           pathwaysFound.add(p);
         }
@@ -669,14 +755,16 @@ export default function App() {
   }, [secCoords, currentCenter]);
 
   const uniqueEdges = useMemo(() => {
-    const edgeSet = new Map<string, [string, string, string]>();
+    const edgeSet = new Map<string, [string, string, string, number | null]>();
     selectedPathways.forEach(p => {
       const G_s = secondaryGraphs[p];
       if (G_s) {
-        G_s.edges.forEach(([u, v]) => {
+        G_s.edges.forEach(([u, v, score]) => {
           const key = u < v ? `${u}-${v}` : `${v}-${u}`;
-          if (!edgeSet.has(key)) {
-             edgeSet.set(key, [u, v, p]);
+          const existing = edgeSet.get(key);
+          const rank = (value: number | null) => value == null ? -1 : value;
+          if (!existing || rank(score) > rank(existing[3])) {
+             edgeSet.set(key, [u, v, p, score]);
           }
         });
       }
@@ -684,28 +772,88 @@ export default function App() {
     return Array.from(edgeSet.values());
   }, [selectedPathways, secondaryGraphs]);
 
-  // Re-fetch Omnipath when network topology changes significantly
-  useEffect(() => {
-    const allNodesSet = new Set<string>();
-    uniqueEdges.forEach(([u, v]) => {
-      allNodesSet.add(u);
-      allNodesSet.add(v);
+  const simNodes = useMemo(() => {
+    const nodes = new Set<string>();
+    selectedPathways.forEach(p => {
+      secondaryGraphs[p]?.nodes.forEach(n => nodes.add(n));
     });
-    const allNodes = Array.from(allNodesSet);
-    if (allNodes.length === 0) return;
-    
-    // Throttle / debounce omnipath fetching so it doesn't spam on minor changes
+    uniqueEdges.forEach(([u, v]) => {
+      nodes.add(u);
+      nodes.add(v);
+    });
+    return Array.from(nodes);
+  }, [selectedPathways, secondaryGraphs, uniqueEdges]);
+
+  const edgeKey = useMemo(() => {
+    const keys = uniqueEdges.map(([u, v]) => (u < v ? `${u}|${v}` : `${v}|${u}`));
+    keys.sort();
+    return keys.join(",");
+  }, [uniqueEdges]);
+
+  useEffect(() => {
+    if (!user) return;
+    fetchContexts().then(result => {
+      if ("error" in result) {
+        setMeasurementError(result.error);
+        return;
+      }
+      setContexts(result.contexts);
+      setDepmapRelease(result.release);
+      setMeasurementError(null);
+    });
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || simNodes.length === 0) return;
+    let cancelled = false;
+    fetchMeasurements(simNodes, contextId).then(result => {
+      if (cancelled) return;
+      if ("error" in result) {
+        setMeasurementError(result.error);
+        setMeasurements({});
+        return;
+      }
+      setMeasurementError(null);
+      setDepmapRelease(result.release);
+      setMeasurements(result.genes);
+    });
+    return () => { cancelled = true; };
+  }, [user, simNodes, contextId]);
+
+  // Re-fetch OmniPath signs through the server when the visible edge set changes.
+  useEffect(() => {
+    const generation = ++omnipathFetchGen.current;
+    if (edgeKey === "") {
+      setOmnipathEdges([]);
+      setOmnipathError(null);
+      setOmnipathForKey("");
+      return;
+    }
+    setOmnipathForKey(null);
+    const keyAtFetch = edgeKey;
+    if (effective.omnipathDatasets.length === 0) {
+      setOmnipathEdges([]);
+      setOmnipathError(null);
+      setOmnipathForKey(edgeKey);
+      return;
+    }
+    const nodes = simNodes;
+    const datasets = effective.omnipathDatasets;
     const timeout = setTimeout(() => {
-      fetchOmnipathInteractions(allNodes).then(edges => {
-        setOmnipathEdges(edges);
-        if (edges.length > 0) {
-          setStatusMsg(<span className="text-emerald-500 text-xs">Loaded {edges.length} directed regulatory interactions.</span>);
+      fetchOmnipathInteractions(nodes, datasets).then(result => {
+        if (generation !== omnipathFetchGen.current) return;
+        setOmnipathForKey(keyAtFetch);
+        if (!result.ok) {
+          setOmnipathEdges([]);
+          setOmnipathError("error" in result ? result.error : "OmniPath proxy failed");
+          return;
         }
+        setOmnipathError(null);
+        setOmnipathEdges(result.interactions);
       });
     }, 1000);
-    
     return () => clearTimeout(timeout);
-  }, [uniqueEdges]);
+  }, [edgeKey, simNodes, effective.omnipathDatasets]);
 
   // Determine opacity for a node based on current selection
   const getNodeOpacity = (node: string, isPathway: boolean) => {
@@ -736,73 +884,74 @@ export default function App() {
     return h === 0 ? "azure" : h === 1 ? "mint" : h === 2 ? "amber" : "slate";
   };
   
-  const COLOR_HEX: Record<string, string> = {
-    azure: "#00B2FF",
-    mint: "#00FFC2",
-    amber: "#EAB308",
-    crimson: "#E11D48",
-    slate: "#475569"
-  };
-  
+  const chronosColorScale = useMemo(() => {
+    return d3.scaleLinear<string>()
+      .domain(effective.chronosDomain)
+      .range(effective.chronosRange)
+      .clamp(effective.chronosClamp);
+  }, [effective.chronosDomain, effective.chronosRange, effective.chronosClamp]);
+
   const expressionColorScale = useMemo(() => {
     return d3.scaleLinear<string>()
-      .domain([-3, 0, 3])
-      .range(["#3b82f6", "#334155", "#ef4444"])
-      .clamp(true);
-  }, []);
-
-  const hotspotColorScale = useMemo(() => {
-    return d3.scaleLinear<string>()
-      .domain([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-      .range(["#1e1b4b", "#2563eb", "#06b6d4", "#eab308", "#f97316", "#ef4444"])
-      .clamp(true);
-  }, []);
-
-  // Pathway-level average activation frequency over last 50 ticks
-  const pathwayHotspotScores = useMemo(() => {
-    const scores: Record<string, number> = {};
-    selectedPathways.forEach(p => {
-      const G = secondaryGraphs[p];
-      if (G && G.nodes.length > 0) {
-        let sum = 0;
-        let count = 0;
-        G.nodes.forEach(n => {
-          sum += activationFrequencies[n] ?? (simState[n] ? 1 : 0);
-          count++;
-        });
-        scores[p] = count > 0 ? sum / count : 0;
-      } else {
-        scores[p] = 0;
-      }
-    });
-    return scores;
-  }, [selectedPathways, secondaryGraphs, activationFrequencies, simState]);
-
-  // Top hotspot nodes ranked by activation frequency
-  const { topHotspots, hotspotCount } = useMemo(() => {
-    const entries = (Object.entries(activationFrequencies) as [string, number][]).map(([node, freq]) => ({ node, freq: Number(freq) }));
-    entries.sort((a, b) => b.freq - a.freq);
-    const activeCount = entries.filter(e => e.freq >= 0.7).length;
-    return {
-      topHotspots: entries.slice(0, 5),
-      hotspotCount: activeCount
-    };
-  }, [activationFrequencies]);
+      .domain(effective.expressionDomain)
+      .range(effective.expressionRange)
+      .clamp(effective.expressionClamp);
+  }, [effective.expressionDomain, effective.expressionRange, effective.expressionClamp]);
 
   const getNodeColor = (u: string) => {
-    if (visualMode === 'hotspot') {
-      const freq = activationFrequencies[u] ?? (simState[u] ? 1 : 0);
-      return hotspotColorScale(freq);
+    const measurement = measurements[u.toUpperCase()];
+    if (visualMode === "chronos") {
+      if (measurement?.chronosMean == null) return effective.missingColor;
+      return chronosColorScale(measurement.chronosMean);
     }
-    if (visualMode === 'expression') {
-      const details = proteinDetailsCache[u];
-      if (details && details.expressionLevel !== undefined) {
-        return expressionColorScale(details.expressionLevel);
-      }
-      return "#334155";
+    if (visualMode === "expression") {
+      if (measurement?.exprMean == null) return effective.missingColor;
+      return expressionColorScale(measurement.exprMean);
     }
-    const cat = getProteinColorCat(u);
-    return COLOR_HEX[cat];
+    if (!proteinDetailsCache[u] && effective.fallbackRoleUncached === "missing") return effective.missingColor;
+    const cat = getProteinColorCat(u) as keyof Preferences["rolePalette"];
+    return effective.rolePalette[cat] ?? effective.missingColor;
+  };
+
+  const contextLabel = contexts.find(item => item.id === contextId)?.label ?? PAN_CANCER_LABEL;
+  const signedEdgeCount = uniqueEdges.filter(([u, v]) => signsForEdge(u, v, omnipathEdges).length > 0).length;
+  const chronosEnds = `${effective.chronosDomain[0]}, ${effective.chronosDomain[effective.chronosDomain.length - 1]}`;
+  const expressionStart = effective.expressionDomain[0];
+  const expressionEnd = effective.expressionDomain[effective.expressionDomain.length - 1];
+  const rolePolicy = effective.fallbackRoleUncached === "hash"
+    ? "Uncached genes use placeholder colors from a hash of the symbol. Those colors are not curated roles."
+    : "Uncached genes use the missing measurement color.";
+  const measurementCaption = visualMode === "chronos"
+    ? `Mean Chronos gene effect in ${contextLabel}. More negative means stronger dependency. n is the number of cell lines with a score. ${effective.chronosClamp ? `Display clamped to [${chronosEnds}].` : `Display domain is [${chronosEnds}], not clamped.`}`
+    : visualMode === "expression"
+    ? `Mean log2(TPM+1) in ${contextLabel}. The DepMap file is already log-transformed. ${effective.expressionClamp ? `Display clamped to ${expressionStart}–${expressionEnd}.` : `Display domain is ${expressionStart} to ${expressionEnd}, not clamped.`}`
+    : `Curated role colors. These are annotations, not a DepMap measurement. ${rolePolicy}`;
+  const provenanceLine = `DepMap ${releaseToken(depmapRelease)} · ${contextLabel} · STRING ${effective.stringSpecies}, network ≥ ${effective.stringRequiredScore}, partners ≥ ${effective.stringPartnerScore}, partner limit ${effective.stringPartnerLimit}, expand ${effective.stringExpandLimit}, network limit ${effective.stringNetworkLimit}, scale 0–1000 · MyGene human`;
+
+  const handleExportJson = () => {
+    const payload = buildViewExport({
+      generatedAt: new Date().toISOString(),
+      context: { id: contextId, label: contextLabel },
+      depmapRelease,
+      nodes: simNodes,
+      measurements,
+      edges: uniqueEdges.map(([source, target, pathway, stringScore]) => ({
+        source,
+        target,
+        pathway,
+        stringScore,
+      })),
+      omnipathInteractions: omnipathEdges,
+      omnipathError,
+      snapshot: effective,
+    });
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `poincare-view-${contextId}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   const GRADIENT_PAIRS = [
@@ -859,7 +1008,26 @@ export default function App() {
               onClear={handleClearSearch}
             />
 
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="relative flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-all border font-mono font-medium shadow-sm bg-white/5 hover:bg-white/10 text-slate-200 border-white/10"
+              aria-label="Data sources and settings"
+              title="Data sources and settings"
+            >
+              <Settings className="w-3.5 h-3.5 text-biocyan-400" />
+              {settingsPending && <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-amber-300" />}
+            </button>
+
             {/* Export Poincaré Disc PNG Button (html2canvas) */}
+            <button
+              onClick={handleExportJson}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-all border font-mono font-medium shadow-sm bg-white/5 hover:bg-white/10 text-slate-200 border-white/10"
+              title="Download the current view as JSON with DepMap provenance"
+            >
+              <Download className="w-3.5 h-3.5 text-biocyan-400" />
+              <span className="hidden sm:inline">JSON</span>
+            </button>
             <button 
               onClick={handleExportPNG}
               disabled={isExporting}
@@ -901,96 +1069,61 @@ export default function App() {
           ref={containerRef} 
           className="flex-1 w-full bg-obsidian-900/50 rounded-2xl border border-white/10 relative overflow-hidden shadow-2xl backdrop-blur-sm"
         >
-          {/* Dynamic Hotspot Heatmap Legend & Overlay */}
-          {visualMode === 'hotspot' && (
-            <div className="absolute top-4 left-4 z-10 bg-obsidian-800/90 backdrop-blur-xl p-4 rounded-xl border border-rose-500/40 shadow-[0_8px_32px_rgba(244,63,94,0.25)] w-80 text-slate-300 space-y-3 pointer-events-auto">
-              <div className="flex items-center justify-between">
+          <div className="absolute top-4 left-4 z-10 bg-obsidian-800/90 backdrop-blur-xl p-4 rounded-xl border border-white/10 w-80 text-slate-300 space-y-2 pointer-events-none">
+            <span className="text-xs font-bold text-white font-mono uppercase tracking-wider">
+              {visualMode === "chronos" ? "Mean Chronos" : visualMode === "expression" ? "Mean expression" : "Curated roles"}
+            </span>
+            <p className="text-[11px] text-slate-400 leading-snug">{measurementCaption}</p>
+            <p className="text-[10px] font-mono text-slate-500 leading-snug">
+              {provenanceLine}
+            </p>
+            {stringError && <p className="text-[10px] leading-snug text-rose-300">{stringError}</p>}
+            {(visualMode === "chronos" || visualMode === "expression") && (
+              <>
                 <div className="flex items-center gap-2">
-                  <Flame className="w-4 h-4 text-rose-400 animate-pulse" />
-                  <span className="text-xs font-bold text-white font-mono uppercase tracking-wider">
-                    50-Tick Hotspot Heatmap
-                  </span>
+                  <div
+                    className="h-3 flex-1 rounded-full border border-white/20"
+                    style={{ background: `linear-gradient(to right, ${(visualMode === "chronos" ? effective.chronosRange : effective.expressionRange).join(", ")})` }}
+                  />
+                  <div className="h-3 w-3 rounded-sm border border-white/20" style={{ background: effective.missingColor }} title="Missing measurement" />
                 </div>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">
-                  {simTickCount >= 50 ? "50/50 Ticks (Buffer Full)" : `${simTickCount}/50 Ticks`}
-                </span>
-              </div>
-
-              {/* Heatmap color gradient bar */}
-              <div className="space-y-1">
-                <div className="h-3 w-full rounded-full bg-gradient-to-r from-[#1e1b4b] via-[#2563eb] via-[#06b6d4] via-[#eab308] via-[#f97316] to-[#ef4444] border border-white/20 shadow-inner" />
                 <div className="flex justify-between text-[9px] font-mono text-slate-400">
-                  <span>0% (Quiescent)</span>
-                  <span className="text-amber-400">50% Active</span>
-                  <span className="text-rose-400 font-bold">100% (Hotspot)</span>
+                  <span>{visualMode === "chronos" ? effective.chronosDomain[0] : effective.expressionDomain[0]}</span>
+                  <span>missing</span>
+                  <span>{visualMode === "chronos" ? effective.chronosDomain[effective.chronosDomain.length - 1] : effective.expressionDomain[effective.expressionDomain.length - 1]}</span>
                 </div>
-              </div>
-
-              {/* Top Hotspots pills */}
-              {topHotspots.length > 0 && (
-                <div>
-                  <div className="text-[10px] font-mono text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
-                    <span>Active Signaling Hotspots:</span>
-                    <span className="text-rose-400 font-bold">{hotspotCount} hyperactive</span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {topHotspots.map(({ node, freq }) => (
-                      <button
-                        key={node}
-                        onClick={() => handleNodeClick(node)}
-                        className={cn(
-                          "px-2 py-0.5 rounded text-[10px] font-mono flex items-center gap-1 border transition-all hover:scale-105",
-                          freq >= 0.7 
-                            ? "bg-rose-500/20 text-rose-300 border-rose-500/40 shadow-[0_0_8px_rgba(244,63,94,0.4)]" 
-                            : freq >= 0.4
-                              ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
-                              : "bg-blue-500/20 text-blue-300 border-blue-500/40"
-                        )}
-                        title={`Click to focus on ${node}`}
-                      >
-                        <span>{node}</span>
-                        <span className="font-bold">{Math.round(freq * 100)}%</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Quick simulation controls */}
-              <div className="flex items-center gap-2 pt-1 border-t border-white/5">
-                <button
-                  onClick={handleToggleSim}
-                  className={cn(
-                    "flex-1 py-1.5 px-2 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider border transition-colors flex items-center justify-center gap-1.5",
-                    isSimRunning
-                      ? "bg-amber-500/20 text-amber-300 border-amber-500/40 hover:bg-amber-500/30"
-                      : "bg-biocyan-500/20 text-biocyan-300 border-biocyan-500/40 hover:bg-biocyan-500/30"
-                  )}
-                >
-                  <Activity className="w-3 h-3" />
-                  {isSimRunning ? "Pause Sim" : "Start Sim"}
-                </button>
-                <button
-                  onClick={handleFastForward50Ticks}
-                  className="py-1.5 px-3 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 transition-colors flex items-center gap-1"
-                  title="Simulate 50 ticks to populate rolling buffer"
-                >
-                  <FastForward className="w-3 h-3" />
-                  +50 Ticks
-                </button>
-              </div>
-            </div>
-          )}
+              </>
+            )}
+            <p className="text-[10px] text-slate-500 leading-snug">
+              {measurementError
+                ? measurementError
+                : "Genes absent from this DepMap release stay neutral."}
+            </p>
+            <p className={cn("text-[10px] leading-snug", omnipathError ? "text-rose-300" : "text-slate-500")}>
+              {effective.omnipathDatasets.length === 0
+                ? "OmniPath signs off"
+                : omnipathForKey !== edgeKey
+                ? "Loading OmniPath signs..."
+                : omnipathError
+                ? `OmniPath request failed: ${omnipathError}`
+                : `OmniPath signs on ${signedEdgeCount} of ${uniqueEdges.length} STRING edges. Datasets: ${effective.omnipathDatasets.join(", ")}.`}
+            </p>
+            {effective.omnipathDatasets.length > 0 && (
+              <p className="text-[10px] text-slate-500">
+                stimulation {effective.signStimulation.color} · inhibition {effective.signInhibition.color} · both {effective.signBoth.color}
+              </p>
+            )}
+          </div>
 
           {/* Status Indicator Top Right */}
           <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-2 text-xs">
             <div className="flex items-center gap-2 bg-obsidian-800/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 text-slate-300">
-              <div className={cn("w-2 h-2 rounded-full", loadingString ? "bg-amber-400 animate-pulse" : "bg-bioemerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]")}></div>
-              <span>{loadingString ? "Querying STRING..." : "STRING API Active"}</span>
+              <div className={cn("w-2 h-2 rounded-full", loadingString ? "bg-amber-400 animate-pulse" : stringError ? "bg-rose-400" : "bg-bioemerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]")}></div>
+              <span>{loadingString ? "Querying STRING..." : stringError ? "STRING request failed" : "STRING API Active"}</span>
             </div>
             <div className="flex items-center gap-2 bg-obsidian-800/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 text-slate-300">
               <div className={cn("w-2 h-2 rounded-full", "bg-biocyan-500 shadow-[0_0_8px_rgba(0,178,255,0.8)]")}></div>
-              <span>MyGene API Active</span>
+              <span>{activeNode && proteinDetailsCache[activeNode]?.mygeneError ? "MyGene request failed" : "MyGene API Active"}</span>
             </div>
             
             {/* Global Network Metrics Dashboard */}
@@ -1023,7 +1156,7 @@ export default function App() {
           </div>
 
           {/* The Poincaré Disc SVG Canvas (wrapped for research export) */}
-          <div ref={discExportRef} className="w-full h-full relative bg-[#07090E]">
+          <div ref={discExportRef} className="w-full h-full relative" style={{ background: effective.background }}>
             <svg 
               ref={svgRef} 
               xmlns="http://www.w3.org/2000/svg"
@@ -1066,31 +1199,31 @@ export default function App() {
               {/* Chromatic Edge Gradients */}
               {GRADIENT_PAIRS.map(([c1, c2]) => (
                 <linearGradient key={`${c1}-${c2}`} id={`grad-${c1}-${c2}`}>
-                  <stop offset="0%" stopColor={COLOR_HEX[c1]} />
-                  <stop offset="100%" stopColor={COLOR_HEX[c2]} />
+                  <stop offset="0%" stopColor={effective.rolePalette[c1 as keyof Preferences["rolePalette"]]} />
+                  <stop offset="100%" stopColor={effective.rolePalette[c2 as keyof Preferences["rolePalette"]]} />
                 </linearGradient>
               ))}
               {GRADIENT_PAIRS.filter(([c1, c2]) => c1 !== c2).map(([c1, c2]) => (
                 <linearGradient key={`${c2}-${c1}`} id={`grad-${c2}-${c1}`}>
-                   <stop offset="0%" stopColor={COLOR_HEX[c2]} />
-                   <stop offset="100%" stopColor={COLOR_HEX[c1]} />
+                   <stop offset="0%" stopColor={effective.rolePalette[c2 as keyof Preferences["rolePalette"]]} />
+                   <stop offset="100%" stopColor={effective.rolePalette[c1 as keyof Preferences["rolePalette"]]} />
                 </linearGradient>
               ))}
             </defs>
             <g ref={gRef}>
               {/* Grid Background */}
               {[0.2, 0.4, 0.6, 0.8].map(r => (
-                <circle key={r} cx={0} cy={0} r={R * r} fill="none" stroke="#22d3ee" strokeWidth={1} strokeOpacity={0.05} />
+                <circle key={r} cx={0} cy={0} r={R * r} fill="none" stroke={effective.gridColor} strokeWidth={1} strokeOpacity={0.05} />
               ))}
               {Array.from({length: 12}).map((_, i) => {
                 const angle = (i * Math.PI) / 6;
                 return (
-                  <line key={i} x1={0} y1={0} x2={R * Math.cos(angle)} y2={R * Math.sin(angle)} stroke="#22d3ee" strokeWidth={1} strokeOpacity={0.03} />
+                  <line key={i} x1={0} y1={0} x2={R * Math.cos(angle)} y2={R * Math.sin(angle)} stroke={effective.gridColor} strokeWidth={1} strokeOpacity={0.03} />
                 );
               })}
 
               {/* Event Horizon Circle */}
-              <circle cx={0} cy={0} r={R} fill="none" stroke="#22d3ee" strokeWidth={2} strokeOpacity={0.4} filter="url(#glow-rim)" />
+              <circle cx={0} cy={0} r={R} fill="none" stroke={effective.gridColor} strokeWidth={2} strokeOpacity={0.4} filter="url(#glow-rim)" />
               
               {/* Primary Nodes (Pathways) */}
               {Object.entries(mappedPrimCoords).map(([node, z]: [string, Complex]) => {
@@ -1099,8 +1232,6 @@ export default function App() {
                 const isBloomed = bloomNode === node;
                 const isPathwayHighlighted = highlightedPathways.includes(node);
                 const opacity = getNodeOpacity(node, true);
-                const pwScore = pathwayHotspotScores[node] ?? 0;
-                const isHotspot = visualMode === 'hotspot';
                 
                 return (
                   <g 
@@ -1124,34 +1255,21 @@ export default function App() {
                         />
                         <circle 
                           r={size + 8} 
-                          fill="rgba(56, 189, 248, 0.2)" 
-                          stroke="#22d3ee" 
+                          fill={effective.hubColors.highlight} 
+                          stroke={effective.gridColor} 
                           strokeWidth={1.5} 
                           className="animate-pulse pointer-events-none" 
                         />
                       </>
                     )}
 
-                    {/* Hotspot Corona Ring for high activity pathways */}
-                    {isHotspot && pwScore >= 0.65 && !isPathwayHighlighted && (
-                      <circle
-                        r={size + 12}
-                        fill="none"
-                        stroke="#f97316"
-                        strokeWidth={1.5}
-                        strokeDasharray="4,4"
-                        className="animate-spin pointer-events-none opacity-60"
-                        style={{ animationDuration: '10s' }}
-                      />
-                    )}
-
                     <circle 
                       r={size} 
-                      fill={isPathwayHighlighted ? "rgba(56, 189, 248, 0.25)" : isHotspot ? "rgba(244, 63, 94, 0.2)" : "rgba(225, 29, 72, 0.15)"}
-                      stroke={isPathwayHighlighted ? "#38bdf8" : isHotspot ? hotspotColorScale(pwScore) : isBloomed ? "#fde047" : "#e11d48"} 
+                      fill={isPathwayHighlighted ? effective.hubColors.highlight : effective.hubColors.fill}
+                      stroke={isPathwayHighlighted ? effective.hubColors.highlight : isBloomed ? effective.hubColors.bloom : effective.hubColors.stroke} 
                       strokeOpacity={isPathwayHighlighted ? 1 : 0.8}
-                      strokeWidth={isPathwayHighlighted ? 3.5 : isHotspot ? (pwScore >= 0.7 ? 3.5 : 2.5) : isBloomed ? 3 : 1.5} 
-                      filter={isPathwayHighlighted || isBloomed || (isHotspot && pwScore >= 0.6) ? "url(#glow-rim)" : undefined}
+                      strokeWidth={isPathwayHighlighted ? 3.5 : isBloomed ? 3 : 1.5} 
+                      filter={isPathwayHighlighted || isBloomed ? "url(#glow-rim)" : undefined}
                       className="transition-all duration-300 hover:fill-[rgba(225,29,72,0.3)]"
                     />
                     <text 
@@ -1159,7 +1277,7 @@ export default function App() {
                       textAnchor="middle" 
                       fontSize={14} 
                       fontWeight="700" 
-                      fill={isPathwayHighlighted ? "#38bdf8" : isHotspot ? hotspotColorScale(pwScore) : "#e2e8f0"} 
+                      fill={isPathwayHighlighted ? effective.searchHighlight[0] : "#e2e8f0"} 
                       pointerEvents="none"
                       className="select-none drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] font-sans"
                     >
@@ -1176,18 +1294,6 @@ export default function App() {
                         className="select-none drop-shadow-[0_2px_4px_rgba(0,0,0,1)] font-mono tracking-wider"
                       >
                         ✦ CONNECTED PATHWAY
-                      </text>
-                    ) : isHotspot ? (
-                      <text
-                        y={size + 16}
-                        textAnchor="middle"
-                        fontSize={10}
-                        fontWeight="700"
-                        fill={hotspotColorScale(pwScore)}
-                        pointerEvents="none"
-                        className="select-none drop-shadow-[0_2px_4px_rgba(0,0,0,1)] font-mono tracking-wider"
-                      >
-                        🔥 {Math.round(pwScore * 100)}% ON
                       </text>
                     ) : null}
                   </g>
@@ -1220,39 +1326,26 @@ export default function App() {
               })}
 
               {/* Edges */}
-              {uniqueEdges.map(([u, v, p]) => {
+              {uniqueEdges.map(([u, v, p, score]) => {
                   const z_u = mappedSecCoords[u];
                   const z_v = mappedSecCoords[v];
                   if (!z_u || !z_v) return null;
                   
                   const isSearchedEdge = Boolean(searchedGene && (u === searchedGene || v === searchedGene));
                   const isConnectedToActive = activeNode && (u === activeNode || v === activeNode);
+                  const regulation = edgeRegulation(omnipathEdges, u, v);
+                  const scoreWidth = edgeWidth(score);
+                  const sign = regulation === "stimulation" ? effective.signStimulation : regulation === "inhibition" ? effective.signInhibition : regulation === "both" ? effective.signBoth : null;
                   
                   let strokeColor = isSearchedEdge
-                    ? "#38bdf8"
-                    : isConnectedToActive 
-                      ? `url(#grad-${getProteinColorCat(u)}-${getProteinColorCat(v)})` 
-                      : "#475569";
-                  let strokeWidth = isSearchedEdge ? 2.5 : isConnectedToActive ? 2 : 1;
-                  let edgeOpacity = isSearchedEdge ? 0.95 : activeNode ? (isConnectedToActive ? 0.7 : 0.05) : 0.3;
-                  
-                  if (isSimRunning && simEngine) {
-                    const weightForward = simEngine.edgeWeights.get(`${u}-${v}`);
-                    const weightBackward = simEngine.edgeWeights.get(`${v}-${u}`);
-                    const weight = weightForward !== undefined ? weightForward : (weightBackward !== undefined ? weightBackward : 0);
-                    
-                    const isActiveEdge = simState[u] || simState[v];
-                    
-                    if (weight === 0) {
-                      strokeColor = "#1e293b";
-                      strokeWidth = 1;
-                      edgeOpacity = 0.1;
-                    } else {
-                      strokeColor = weight > 0 ? (isActiveEdge ? "#10b981" : "#064e3b") : (isActiveEdge ? "#f43f5e" : "#881337");
-                      strokeWidth = isActiveEdge ? 2 : 1;
-                      edgeOpacity = isActiveEdge ? 0.7 : 0.15;
-                    }
-                  }
+                    ? effective.searchHighlight[0]
+                    : sign
+                      ? sign.color
+                      : isConnectedToActive 
+                        ? `url(#grad-${getProteinColorCat(u)}-${getProteinColorCat(v)})` 
+                        : effective.edgeDefaultStroke;
+                  const strokeWidth = isSearchedEdge ? Math.max(2.5, scoreWidth) : scoreWidth;
+                  const edgeOpacity = isSearchedEdge ? 0.95 : activeNode ? (isConnectedToActive ? 0.7 : 0.05) : 0.3;
                   
                   return (
                     <line 
@@ -1261,10 +1354,12 @@ export default function App() {
                       x2={z_v.r * R} y2={-z_v.i * R}
                       stroke={strokeColor} 
                       strokeWidth={strokeWidth} 
-                      strokeDasharray={isConnectedToActive && !isSimRunning ? "none" : (isSimRunning ? ((simEngine?.edgeWeights.get(`${u}-${v}`) ?? simEngine?.edgeWeights.get(`${v}-${u}`) ?? 0) < 0 ? "4,4" : "none") : "3,3")} 
+                      strokeDasharray={sign?.dash ?? "none"}
                       opacity={edgeOpacity}
                       className="transition-all duration-500"
-                    />
+                    >
+                      <title>{`${u}–${v} · ${p} · ${score == null ? "STRING score invalid" : `STRING score ${score}`}${regulation === "none" ? "" : ` · OmniPath ${regulation}`}`}</title>
+                    </line>
                   );
               })}
 
@@ -1274,11 +1369,6 @@ export default function App() {
                 const druggable = details ? details.druggable : false;
                 const color = getNodeColor(u);
                 
-                const freq = activationFrequencies[u] ?? (simState[u] ? 1 : 0);
-                const isKnockedOut = knockouts.has(u);
-                const isHotspot = visualMode === 'hotspot';
-                
-                // Calculate global degree for highlighting top nodes
                 const degree = uniqueEdges.filter(([a,b]) => a===u || b===u).length;
                 const isCentral = degree > 4;
 
@@ -1338,69 +1428,45 @@ export default function App() {
                           fill={isSearched ? "#38bdf8" : isActive ? "#ffffff" : color} 
                           className="select-none drop-shadow-[0_2px_4px_rgba(0,0,0,1)] transition-all duration-300 font-mono tracking-wide"
                         >
-                          {u}{isHotspot ? ` (${Math.round(freq * 100)}%)` : ''}{isSearched ? ' ★' : ''}
+                          {u}{isSearched ? ' ★' : ''}
                         </text>
                       </g>
                     )}
 
                     <g transform={`translate(${cx}, ${cy})`}
+                       data-symbol={u}
                        onMouseEnter={() => setHoveredProtein(u)}
                        onMouseLeave={() => setHoveredProtein(null)}
                        onClick={(e) => { 
                          e.stopPropagation(); 
-                         if (isSimRunning && simEngine) {
-                           if (isKnockoutMode) {
-                             simEngine.toggleKnockout(u);
-                             setKnockouts(new Set(simEngine.knockouts));
-                           } else {
-                             const newState = !simState[u];
-                             simEngine.setState(u, newState);
-                             setSimState({ ...simEngine.state });
-                           }
-                         } else {
-                           handleNodeClick(u); 
-                         }
+                         handleNodeClick(u); 
                        }}
-                       className={isSimRunning ? (isKnockoutMode ? "cursor-alias" : "cursor-pointer") : "cursor-pointer"}
+                       className="cursor-pointer"
                     >
-                      {/* Searched Gene Concentric Animated Beacons */}
-                      {isSearched && !isSimRunning && (
+                      {isSearched && (
                         <g className="pointer-events-none">
-                          <circle r={size + 14} fill="none" stroke="#38bdf8" strokeWidth="2.5" strokeDasharray="4,4" className="animate-spin" style={{ animationDuration: '6s' }} />
-                          <circle r={size + 8} fill="none" stroke="#22d3ee" strokeWidth="2" className="animate-ping" style={{ animationDuration: '2.5s' }} />
-                          <circle r={size + 3} fill="rgba(56, 189, 248, 0.25)" stroke="#06b6d4" strokeWidth="1.5" />
+                          <circle r={size + 14} fill="none" stroke={effective.searchHighlight[0]} strokeWidth="2.5" strokeDasharray="4,4" className="animate-spin" style={{ animationDuration: '6s' }} />
+                          <circle r={size + 8} fill="none" stroke={effective.searchHighlight[1]} strokeWidth="2" className="animate-ping" style={{ animationDuration: '2.5s' }} />
+                          <circle r={size + 3} fill={effective.hubColors.highlight} stroke={effective.searchHighlight[3]} strokeWidth="1.5" />
                         </g>
                       )}
 
-                      {/* Hotspot Dynamic Pulsing Beacon */}
-                      {isHotspot && !isKnockedOut && freq >= 0.7 && (
-                        <g className="pointer-events-none">
-                          <circle r={size + 6} fill="none" stroke="#ef4444" strokeWidth="1.5" strokeDasharray="3,3" className="animate-spin" style={{ animationDuration: '5s' }} />
-                          <circle r={size + 4} fill="rgba(239, 68, 68, 0.2)" stroke="#f43f5e" strokeWidth="1" className="animate-pulse" />
-                        </g>
-                      )}
-
-                      {isActive && !isSimRunning && !isSearched && hudBracket}
+                      {isActive && !isSearched && hudBracket}
                       
-                      {/* Node circle */}
                       <circle 
-                        r={size + (isSearched ? 4 : isActive && !isSimRunning ? 4 : 0)} 
-                        fill={isKnockedOut ? "#0f172a" : isHotspot ? color : isSimRunning ? (simState[u] ? color : "#1e293b") : (isSearched ? "#0ea5e9" : color)} 
-                        stroke={isSearched ? "#ffffff" : isHotspot ? (isKnockedOut ? "#ef4444" : freq >= 0.7 ? "#ef4444" : freq >= 0.4 ? "#f59e0b" : "#3b82f6") : (isActive && !isSimRunning) || (isSimRunning && simState[u]) ? "#ffffff" : (isKnockedOut ? "#ef4444" : "#0B0E14")} 
-                        strokeWidth={isSearched ? 2.5 : isHotspot ? (freq >= 0.7 ? 2.5 : 1.5) : (isActive && !isSimRunning) || (isSimRunning && simState[u]) || isKnockedOut ? 2 : 1} 
-                        strokeDasharray={isKnockedOut ? "2,2" : "none"}
+                        r={size + (isSearched || isActive ? 4 : 0)} 
+                        fill={isSearched ? "#0ea5e9" : color} 
+                        stroke={isSearched || isActive ? "#ffffff" : "#0B0E14"} 
+                        strokeWidth={isSearched || isActive ? 2 : 1} 
                         className="transition-all duration-300"
                       />
-                      {isKnockedOut && (
-                        <path d={`M ${-size/2} ${-size/2} L ${size/2} ${size/2} M ${size/2} ${-size/2} L ${-size/2} ${size/2}`} stroke="#ef4444" strokeWidth="2" />
-                      )}
                       <circle 
                         r={size * 1.5} 
                         fill={isSearched ? "#38bdf8" : color} 
-                        opacity={isSearched ? 0.6 : isHotspot ? Math.max(0.2, freq * 0.8) : isSimRunning ? (simState[u] ? 0.8 : 0) : (isCentral ? 0.4 : 0.1)} 
+                        opacity={isSearched ? 0.6 : (isCentral ? 0.4 : 0.1)} 
                         filter="url(#glow-emerald)" 
                         className="pointer-events-none transition-all duration-300"
-                        style={{ filter: `drop-shadow(0 0 ${isSearched ? 20 : isHotspot ? (freq >= 0.7 ? 16 : 8) : isSimRunning && simState[u] ? 15 : blurValue*2}px ${isSearched ? "#38bdf8" : color})` }}
+                        style={{ filter: `drop-shadow(0 0 ${isSearched ? 20 : blurValue*2}px ${isSearched ? "#38bdf8" : color})` }}
                       />
                     </g>
                   </g>
@@ -1412,109 +1478,60 @@ export default function App() {
 
           {/* Neumorphic Control Pod */}
           <div className="absolute bottom-6 left-6 z-10 w-80 bg-obsidian-800/80 backdrop-blur-xl p-5 rounded-2xl border border-white/10 shadow-[0_8px_32px_rgba(0,0,0,0.6)] space-y-4">
-            <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2">
-              {omnipathEdges.length > 0 ? "Systems Biology Knockout Engine" : "Illustrative Boolean Engine"}
-            </h3>
-            <p className={cn("text-[10px] leading-tight mb-2 -mt-1", omnipathEdges.length > 0 ? "text-emerald-500/80" : "text-slate-500")}>
-              {omnipathEdges.length > 0 
-                ? `*Simulation powered by ${omnipathEdges.length} directed regulatory interactions from OmniPath.`
-                : "*Animation based on randomized weights over undirected STRING edges. Not biologically predictive."}
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={handleToggleSim}
-                className={cn(
-                  "flex-1 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors border",
-                  isSimRunning 
-                    ? "bg-amber-500/20 text-amber-400 border-amber-500/50 hover:bg-amber-500/30" 
-                    : "bg-biocyan-500/20 text-biocyan-400 border-biocyan-500/50 hover:bg-biocyan-500/30"
-                )}
-              >
-                {isSimRunning ? "Pause Sim" : "Start Sim"}
-              </button>
-              <button
-                onClick={() => setIsKnockoutMode(!isKnockoutMode)}
-                className={cn(
-                  "flex-1 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors border",
-                  isKnockoutMode
-                    ? "bg-biocrimson-500/20 text-biocrimson-400 border-biocrimson-500/50 hover:bg-biocrimson-500/30"
-                    : "bg-slate-800 text-slate-400 border-white/10 hover:bg-slate-700"
-                )}
-                title="Toggle Knockout Mode (Click nodes to disable them)"
-              >
-                Knockouts: {isKnockoutMode ? "ON" : "OFF"}
-              </button>
-              <button
-                onClick={handleResetSim}
-                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold border border-white/10 transition-colors"
-                title="Reset Simulation"
-              >
-                <RefreshCw className="w-4 h-4" />
-              </button>
-            </div>
-            {simEngine && (
-              <div className="pt-2">
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-300">Sim Speed</span>
-                  <span className="text-amber-400 font-bold">{simSpeed}ms</span>
-                </div>
-                <input 
-                  type="range" min="100" max="2000" step="100" value={simSpeed} 
-                  onChange={e => setSimSpeed(parseInt(e.target.value))}
-                  className="w-full h-1 bg-obsidian-900 rounded-lg appearance-none cursor-pointer accent-amber-500"
-                />
-              </div>
-            )}
+            <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-2">Cell-line context</h3>
+            <select
+              value={contextId}
+              onChange={event => setContextId(event.target.value)}
+              className="w-full bg-obsidian-900 border border-white/10 rounded-lg px-2 py-2 text-xs text-slate-200"
+            >
+              {contexts.map(item => (
+                <option key={item.id} value={item.id}>{item.label}</option>
+              ))}
+            </select>
             
             <div className="pt-2 border-t border-white/5">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase">Poincaré Color Mode</h3>
+                <h3 className="text-xs font-bold text-slate-400 tracking-wider uppercase">Color</h3>
                 <span className="text-[10px] font-mono font-bold text-amber-400 uppercase">
-                  {visualMode === 'hotspot' ? '🔥 Hotspots' : visualMode === 'expression' ? 'RNA Log2FC' : 'Roles'}
+                  {visualMode === "chronos" ? "Chronos" : visualMode === "expression" ? "Expression" : "Roles"}
                 </span>
               </div>
               <div className="grid grid-cols-3 gap-1.5 p-1 bg-obsidian-900/90 rounded-xl border border-white/10">
                 <button
-                  onClick={() => setVisualMode('roles')}
+                  onClick={() => setVisualMode("chronos")}
                   className={cn(
                     "py-2 px-1 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all text-center",
-                    visualMode === 'roles'
-                      ? "bg-biocyan-500/20 text-biocyan-300 border border-biocyan-500/50 shadow-sm"
+                    visualMode === "chronos"
+                      ? "bg-biocrimson-500/20 text-biocrimson-300 border border-biocrimson-500/50 shadow-sm"
                       : "text-slate-400 hover:text-slate-200"
                   )}
-                  title="Taxonomic roles: Oncogenes, Tumor Suppressors, Druggable Targets"
+                  title="Mean Chronos gene effect in the selected context"
                 >
-                  Roles
+                  Chronos
                 </button>
                 <button
-                  onClick={() => setVisualMode('expression')}
+                  onClick={() => setVisualMode("expression")}
                   className={cn(
                     "py-2 px-1 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all text-center",
-                    visualMode === 'expression'
+                    visualMode === "expression"
                       ? "bg-bioemerald-500/20 text-bioemerald-300 border border-bioemerald-500/50 shadow-sm"
                       : "text-slate-400 hover:text-slate-200"
                   )}
-                  title="Synthetic RNA expression Log2FC gradient"
+                  title="Mean log2(TPM+1) from the DepMap expression file"
                 >
                   Expression
                 </button>
                 <button
-                  onClick={() => {
-                    setVisualMode('hotspot');
-                    if (!isSimRunning && simTickCount < 10) {
-                      handleFastForward50Ticks();
-                    }
-                  }}
+                  onClick={() => setVisualMode("roles")}
                   className={cn(
-                    "py-2 px-1 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all text-center flex items-center justify-center gap-1",
-                    visualMode === 'hotspot'
-                      ? "bg-gradient-to-r from-orange-500/25 to-rose-500/25 text-rose-300 border border-rose-500/50 shadow-[0_0_12px_rgba(244,63,94,0.3)] font-black"
-                      : "text-slate-400 hover:text-rose-300"
+                    "py-2 px-1 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all text-center",
+                    visualMode === "roles"
+                      ? "bg-biocyan-500/20 text-biocyan-300 border border-biocyan-500/50 shadow-sm"
+                      : "text-slate-400 hover:text-slate-200"
                   )}
-                  title="50-tick sliding window average activation frequency (state=ON) dynamic heatmap"
+                  title="Curated role colors. Not a DepMap measurement."
                 >
-                  <Flame className="w-3 h-3 text-rose-400 shrink-0" />
-                  Hotspots
+                  Roles
                 </button>
               </div>
             </div>
@@ -1587,14 +1604,44 @@ export default function App() {
               targetCenterRef.current = targetPos;
             }
           }}
-          hotspotData={simEngine && activeNode ? {
-            frequency: activationFrequencies[activeNode] ?? (simEngine.getNodeFrequency(activeNode).frequency),
-            onTicks: simEngine.getNodeFrequency(activeNode).onTicks,
-            totalTicks: Math.max(1, simEngine.getNodeFrequency(activeNode).totalTicks),
-            isSimulationRunning: isSimRunning
-          } : undefined}
+          measurement={activeNode.toUpperCase() in measurements ? measurements[activeNode.toUpperCase()] : undefined}
+          measurementError={measurementError}
+          depmapRelease={depmapRelease}
+          contextLabel={contextLabel}
+          curatedNoteVisible={effective.curatedNoteVisible}
+          taxon={effective.stringSpecies}
         />
       )}
+
+      <SettingsPanel
+        open={settingsOpen}
+        applied={applied}
+        disc={{ zeta, bloomScale, selectedPathways, context: contextId, visualMode }}
+        operator={operatorInfo}
+        operatorError={operatorError}
+        formError={settingsError}
+        onPendingChange={setSettingsPending}
+        onClose={() => setSettingsOpen(false)}
+        onApply={draft => { void commitPreferences(draft, true); }}
+        onImmediate={draft => {
+          const next = { ...applied };
+          for (const item of SETTINGS) {
+            if (item.commit !== "immediate" || !item.preferenceKey || item.discControl) continue;
+            (next as Record<string, unknown>)[item.preferenceKey] = draft[item.preferenceKey];
+          }
+          void commitPreferences(next, false);
+        }}
+        onResetGroup={settings => {
+          const next: Preferences = { ...applied, zeta, bloomScale, selectedPathways, context: contextId, visualMode };
+          for (const item of settings) {
+            if (!item.preferenceKey) continue;
+            (next as Record<string, unknown>)[item.preferenceKey] = structuredClone(item.default);
+          }
+          const refetch = settings.some(item => item.effect === "refetch");
+          void commitPreferences(next, refetch, false);
+        }}
+        onResetAll={() => { void commitPreferences(defaultPreferences(), true, false); }}
+      />
 
     </div>
   );

@@ -790,107 +790,37 @@ export const CURATED_CANCER_GENES: Record<string, CuratedGeneData> = {
   }
 };
 
+export type UncuratedGeneHint = {
+  symbol: string;
+  name: string;
+  role: "oncogene" | "tumor_suppressor" | "unknown";
+  pathways?: string[];
+};
+
 /**
- * Helper to dynamically create fallback curated data for any gene symbol
- * using gene name, MyGene info, and topological metrics.
+ * Role hint for genes that are not in the curated set.
+ * Uses MyGene summary text only. Does not invent DepMap scores,
+ * druggability tiers, or binding sites.
  */
-export function generateFallbackGeneData(symbol: string, myGeneHit?: any): CuratedGeneData {
-  const sumHash = symbol.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+export function generateFallbackGeneData(symbol: string, myGeneHit?: any): UncuratedGeneHint {
   const text = (myGeneHit?.summary || "").toLowerCase();
-  
-  let role: CuratedGeneData['role'] = 'essential_regulator';
-  let roleDescription = myGeneHit?.summary || `${symbol} is an active participant in human oncogenic signaling and intracellular regulation.`;
-  
-  if (text.includes("tumor suppressor") || text.includes("suppressor of")) {
+
+  let role: UncuratedGeneHint["role"] = "unknown";
+  if (/\btumor suppressor gene\b/.test(text) || /\b(is|as) an? tumor suppressor\b/.test(text)) {
     role = "tumor_suppressor";
-  } else if (text.includes("oncogene") || text.includes("proto-oncogene")) {
+  } else if (/\bproto-oncogene\b/.test(text) || /\boncogene\b/.test(text)) {
     role = "oncogene";
   }
 
-  const isKinase = text.includes("kinase") || text.includes("receptor");
-  const isDruggable = isKinase || Boolean(myGeneHit?.pharos);
-  
-  // Calculate calibrated DepMap score
-  let depMapScore = -0.45;
-  if (role === 'tumor_suppressor') {
-    depMapScore = ((sumHash % 40) / 100) + 0.05; // +0.05 to +0.45
-  } else if (role === 'oncogene') {
-    depMapScore = -(((sumHash % 80) / 100) + 0.5); // -0.5 to -1.3
-  } else {
-    depMapScore = -(((sumHash % 60) / 100) + 0.2); // -0.2 to -0.8
-  }
-
-  let depTier: DepMapInfo['tier'] = 'Moderate Dependency';
-  if (depMapScore < -1.0) depTier = 'Common Essential';
-  else if (depMapScore < -0.5) depTier = 'Strong Selective Dependency';
-  else if (depMapScore > 0.0) depTier = 'Non-Essential';
-
-  // Extract binding sites from InterPro domains if present
-  const bindingSites: BindingSiteInfo[] = [];
-  if (myGeneHit?.interpro && Array.isArray(myGeneHit.interpro)) {
-    myGeneHit.interpro.slice(0, 3).forEach((ip: any) => {
-      bindingSites.push({
-        name: ip.desc || "Functional Protein Domain",
-        residues: "Conserved Domain",
-        description: `Characterized InterPro protein domain motif: ${ip.desc || ip.id}`,
-        type: ip.desc?.toLowerCase().includes("catalytic") ? "Catalytic Site" : "Effector Interface"
-      });
-    });
-  }
-
-  if (bindingSites.length === 0) {
-    if (isKinase) {
-      bindingSites.push(
-        {
-          name: "ATP Catalytic Kinase Pocket",
-          residues: "Catalytic Core (Hinge & Cleft)",
-          description: "Coordinates ATP gamma-phosphate transfer to downstream substrate proteins.",
-          type: "Catalytic Site"
-        },
-        {
-          name: "Regulatory Activation Loop",
-          residues: "Activation Segment",
-          description: "Undergoes conformational transition upon phosphorylation to regulate kinase activity.",
-          type: "Regulatory Motif"
-        }
-      );
-    } else {
-      bindingSites.push(
-        {
-          name: "Primary Protein-Protein Interaction Interface",
-          residues: "Conserved Structural Domain",
-          description: "Facilitates macromolecular complex assembly and regulatory partner recruitment.",
-          type: "Effector Interface"
-        },
-        {
-          name: "Allosteric Regulatory Region",
-          residues: "Regulatory Segment",
-          description: "Modulates functional affinity in response to cellular biochemical signals.",
-          type: "Allosteric Pocket"
-        }
-      );
-    }
-  }
+  const pathwayRecord = myGeneHit?.pathway;
+  const pathways = pathwayRecord && typeof pathwayRecord === "object"
+    ? Object.keys(pathwayRecord).map(k => `${k.toUpperCase()} Pathway`)
+    : undefined;
 
   return {
     symbol,
-    name: myGeneHit?.name || `${symbol} protein`,
+    name: myGeneHit?.name || symbol,
     role,
-    roleDescription,
-    druggability: {
-      status: isDruggable ? "Druggable Target" : "Understudied / Tool Target",
-      tier: isDruggable ? "Tchem" : "Tbio",
-      isDruggable,
-      targetClass: isKinase ? "Protein Kinase" : "Intracellular Signaling Protein",
-      druggabilityScore: isDruggable ? 75 : 45
-    },
-    depMap: {
-      score: parseFloat(depMapScore.toFixed(2)),
-      tier: depTier,
-      percentile: Math.min(95, Math.max(10, Math.round(Math.abs(depMapScore) * 70))),
-      summary: `Estimated dependency across cancer lineages based on functional role and network centrality.`
-    },
-    bindingSites,
-    pathways: myGeneHit?.pathway ? Object.keys(myGeneHit.pathway).map(k => `${k.toUpperCase()} Pathway`) : ["Cellular Signaling"]
+    pathways: pathways && pathways.length > 0 ? pathways : undefined,
   };
 }

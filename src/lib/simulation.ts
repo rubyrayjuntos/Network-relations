@@ -11,6 +11,9 @@ export class BooleanNetwork {
   directedEdges: { source: string, target: string, weight: number }[];
   history: Map<string, boolean[]>;
   tickCount: number;
+  poweredByOmnipath: boolean;
+  builtForEdgeKey = "";
+  sourceOmnipath: OmnipathInteraction[] = [];
   static readonly WINDOW_SIZE = 50;
 
   constructor(nodes: string[], edges: [string, string][], omnipathInteractions?: OmnipathInteraction[]) {
@@ -22,8 +25,10 @@ export class BooleanNetwork {
     this.directedEdges = [];
     this.history = new Map();
     this.tickCount = 0;
+    this.poweredByOmnipath = Boolean(omnipathInteractions && omnipathInteractions.length > 0);
+    this.sourceOmnipath = omnipathInteractions ?? [];
 
-    if (omnipathInteractions && omnipathInteractions.length > 0) {
+    if (this.poweredByOmnipath && omnipathInteractions) {
       omnipathInteractions.forEach(interaction => {
         let weight = 0;
         if (interaction.is_stimulation && !interaction.is_inhibition) weight = 1;

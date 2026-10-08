@@ -1,13 +1,18 @@
-export function betweennessCentrality(nodes: string[], edges: [string, string][]): Record<string, number> {
+type EdgeList = ReadonlyArray<readonly [string, string, ...unknown[]]>;
+
+export function betweennessCentrality(nodes: string[], edges: EdgeList): Record<string, number> {
   const cb: Record<string, number> = {};
   const adj: Record<string, string[]> = {};
   
   nodes.forEach(n => { cb[n] = 0; adj[n] = []; });
+  const seen = new Set<string>();
   edges.forEach(([u, v]) => {
-    if (adj[u] && adj[v]) {
-      adj[u].push(v);
-      adj[v].push(u);
-    }
+    if (!adj[u] || !adj[v] || u === v) return;
+    const key = u < v ? `${u}|${v}` : `${v}|${u}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    adj[u].push(v);
+    adj[v].push(u);
   });
 
   nodes.forEach(s => {
@@ -65,7 +70,7 @@ export function betweennessCentrality(nodes: string[], edges: [string, string][]
   return cb;
 }
 
-export function calculateNetworkMetrics(nodes: string[], edges: [string, string][]) {
+export function calculateNetworkMetrics(nodes: string[], edges: EdgeList) {
   const adj: Record<string, string[]> = {};
   nodes.forEach(n => { adj[n] = []; });
   
